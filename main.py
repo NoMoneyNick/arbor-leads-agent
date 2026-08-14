@@ -11,7 +11,7 @@ import stripe
 
 
 # ============================================================
-# VECTOR DATA LABS - LEEDS PRODUCTION VERSION 1.5
+# VECTOR DATA LABS - LEEDS PRODUCTION VERSION 1.6
 # ============================================================
 
 app = FastAPI()
@@ -36,7 +36,7 @@ PUBLIC_APP_URL = os.getenv("PUBLIC_APP_URL")
 
 RESEND_URL = "https://api.resend.com/emails"
 
-# Layer 12: Main Planning Layer (Reliable, but contains history)
+# Layer 12 is the most complete history of Leeds Planning
 LEEDS_PLANNING_URL = (
     "https://mapservices.leeds.gov.uk/"
     "arcgis/rest/services/Public/Planning/MapServer/12/query"
@@ -60,7 +60,6 @@ TREE_KEYWORDS = [
     "conifer", "pollard", "reduction", "thinning", "conservation area"
 ]
 
-# Skip these to avoid non-tree leads
 SKIP_WORDS = ["dwelling", "extension", "new build", "erection of"]
 
 # ============================================================
@@ -70,6 +69,15 @@ SKIP_WORDS = ["dwelling", "extension", "new build", "erection of"]
 def safe_string(value):
     return str(value).strip() if value else ""
 
+def get_best_date(record):
+    """Tries multiple date fields used by Leeds Council."""
+    # Try DATEAPVAL first, then DATE_RECEIVED as a backup
+    val = record.get("DATEAPVAL") or record.get("DATE_RECEIVED")
+    try:
+        return float(val) if val else 0
+    except:
+        return 0
+
 def classify_tree_application(record):
     proposal = safe_string(record.get("PROPOSAL")).lower()
     if not proposal: return {"is_tree_related": False}
@@ -77,39 +85,35 @@ def classify_tree_application(record):
     matches = [k for k in TREE_KEYWORDS if k in proposal]
     score = len(matches)
     
-    # Bonuses
     if any(x in proposal for x in ["fell", "remove", "crown", "tpo"]):
         score += 5
         
     is_construction = any(w in proposal for w in SKIP_WORDS)
 
-    # Simplified logic for testing
     if len(matches) > 0 and not is_construction:
         return {"is_tree_related": True, "score": score}
-    if score > 8: # Keep high-value construction tree jobs
+    if score > 8: 
         return {"is_tree_related": True, "score": score}
         
     return {"is_tree_related": False}
 
 # ============================================================
-# DATA FETCHING
+# DATA FETCHING (BASIC & ROBUST)
 # ============================================================
 
 def fetch_leeds_records(max_records=1000):
-    """Fetches the newest records from Layer 12."""
-    # We only ask for the fields we need to avoid server timeout
-    fields = "REFVAL,ADDRESS,PROPOSAL,DATEAPVAL,APPNAME"
+    """Fetches records without complex server-side sorting to prevent 400 errors."""
     
+    # We ask for all fields but NO sorting. Sorting on the council side breaks the query.
     params = {
         "where": "1=1",
-        "outFields": fields,
+        "outFields": "*",
         "returnGeometry": "false",
         "resultRecordCount": max_records,
-        "orderByFields": "DATEAPVAL DESC", # GET NEWEST FIRST
         "f": "json",
     }
     
-    logger.info("Requesting 1,000 newest records from Leeds Layer 12...")
+    logger.info(f"Attempting to fetch {max_records} raw records from Leeds...")
     
     try:
         response = requests.get(LEEDS_PLANNING_URL, params=params, timeout=30)
@@ -117,13 +121,20 @@ def fetch_leeds_records(max_records=1000):
         data = response.json()
         
         if "error" in data:
-            logger.error(f"Council API Error: {data['error']}")
+            logger.error(f"Leeds API returned error: {data['error']}")
             return []
             
         features = data.get("features", [])
-        return [f.get("attributes", {}) for f in features]
+        records = [f.get("attributes", {}) for f in features]
+        
+        # WE sort them here in Python instead of asking the Council to do it
+        records.sort(key=lambda x: get_best_date(x), reverse=True)
+        
+        logger.info(f"Successfully retrieved and sorted {len(records)} records.")
+        return records
+
     except Exception as e:
-        logger.error(f"Network Fetch Error: {e}")
+        logger.error(f"Critical Fetch Error: {e}")
         return []
 
 # ============================================================
@@ -132,40 +143,38 @@ def fetch_leeds_records(max_records=1000):
 
 @app.get("/")
 def health_check():
-    return {"status": "Leeds Tree Agent V1.5 Active"}
+    return {"status": "Leeds Tree Agent V1.6 Active"}
 
 @app.get("/test-leeds")
 def test_leeds():
     raw_records = fetch_leeds_records(max_records=1000)
     
-    # We only want records from the last 120 days
-    cutoff = datetime.now(timezone.utc) - timedelta(days=120)
+    # Filter for last 120 days
+    cutoff_ms = (datetime.now(timezone.utc) - timedelta(days=120)).timestamp() * 1000
     
     valid_leads = []
-    seen_dates = []
+    debug_dates = []
     
     for r in raw_records:
-        ms = r.get("DATEAPVAL")
-        if not ms: continue
+        date_val = get_best_date(r)
         
-        app_date = datetime.fromtimestamp(float(ms) / 1000, tz=timezone.utc)
+        # Collect the first few dates we see for debugging
+        if date_val > 0 and len(debug_dates) < 5:
+            readable = datetime.fromtimestamp(date_val/1000, tz=timezone.utc).strftime("%Y-%m-%d")
+            debug_dates.append(readable)
         
-        # Track dates for debugging
-        if len(seen_dates) < 5:
-            seen_dates.append(app_date.strftime("%Y-%m-%d"))
-        
-        if app_date > cutoff:
+        if date_val >= cutoff_ms:
             classification = classify_tree_application(r)
             if classification["is_tree_related"]:
                 r["_score"] = classification["score"]
-                r["_date"] = app_date.strftime("%Y-%m-%d")
+                r["_date"] = datetime.fromtimestamp(date_val/1000, tz=timezone.utc).strftime("%Y-%m-%d")
                 valid_leads.append(r)
 
     return {
-        "total_scanned": len(raw_records),
-        "debug_newest_dates_seen": seen_dates,
-        "leads_found_in_last_120_days": len(valid_leads),
-        "leads": valid_leads[:15]
+        "total_downloaded": len(raw_records),
+        "newest_dates_found": debug_dates,
+        "tree_leads_found": len(valid_leads),
+        "leads": valid_leads[:20]
     }
 
 @app.get("/trigger-scrape")
@@ -173,23 +182,20 @@ def trigger_scrape(x_trigger_secret: str = Header(default=None)):
     if not TRIGGER_SECRET or x_trigger_secret != TRIGGER_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    raw_records = fetch_leeds_records(max_records=200)
-    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+    raw_records = fetch_leeds_records(max_records=500)
+    cutoff_ms = (datetime.now(timezone.utc) - timedelta(days=30)).timestamp() * 1000
     
     tree_apps = []
     for r in raw_records:
-        ms = r.get("DATEAPVAL")
-        if not ms: continue
-        app_date = datetime.fromtimestamp(float(ms) / 1000, tz=timezone.utc)
-        
-        if app_date > cutoff:
+        date_val = get_best_date(r)
+        if date_val >= cutoff_ms:
             cls = classify_tree_application(r)
             if cls["is_tree_related"]:
                 r["_score"] = cls["score"]
                 tree_apps.append(r)
 
     if not tree_apps:
-        return {"status": "No leads found today."}
+        return {"status": "No leads found recently."}
 
     tree_apps.sort(key=lambda x: x["_score"], reverse=True)
     best = tree_apps[0]
