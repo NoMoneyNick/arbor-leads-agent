@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+from datetime import datetime, timezone
 
 import requests
 import psycopg2
@@ -30,9 +31,7 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 
 TEST_EMAIL = os.getenv("TEST_EMAIL")
-
 TRIGGER_SECRET = os.getenv("TRIGGER_SECRET")
-
 PUBLIC_APP_URL = os.getenv("PUBLIC_APP_URL")
 
 RESEND_URL = "https://api.resend.com/emails"
@@ -58,7 +57,6 @@ stripe.api_key = STRIPE_SECRET_KEY
 
 
 # Fallback store for webhook idempotency.
-# The database path is preferred when available.
 _processed_sessions_memory = set()
 
 
@@ -245,15 +243,6 @@ def get_test_contractors():
 # ============================================================
 
 def mark_session_processed(session_id: str) -> bool:
-
-    """
-    Returns True the first time a Stripe session id is seen.
-
-    Returns False if the same session has already been processed.
-
-    This prevents Stripe webhook retries from sending duplicate
-    unlocked-lead emails.
-    """
 
     if SUPABASE_DB_URL:
 
@@ -658,20 +647,12 @@ async def stripe_webhook(request: Request):
     )
 
 
-    # ========================================================
-    # 1. READ RAW STRIPE REQUEST
-    # ========================================================
-
     payload = await request.body()
 
     signature = request.headers.get(
         "stripe-signature"
     )
 
-
-    # ========================================================
-    # 2. CHECK WEBHOOK SECRET
-    # ========================================================
 
     if not STRIPE_WEBHOOK_SECRET:
 
@@ -685,10 +666,6 @@ async def stripe_webhook(request: Request):
         )
 
 
-    # ========================================================
-    # 3. CHECK SIGNATURE
-    # ========================================================
-
     if not signature:
 
         logger.error(
@@ -700,10 +677,6 @@ async def stripe_webhook(request: Request):
             detail="Stripe signature missing"
         )
 
-
-    # ========================================================
-    # 4. VERIFY STRIPE EVENT
-    # ========================================================
 
     try:
 
@@ -742,10 +715,6 @@ async def stripe_webhook(request: Request):
     )
 
 
-    # ========================================================
-    # 5. IGNORE EVENTS WE DON'T NEED
-    # ========================================================
-
     if event["type"] != "checkout.session.completed":
 
         logger.info(
@@ -758,40 +727,12 @@ async def stripe_webhook(request: Request):
         }
 
 
-    # ========================================================
-    # 6. GET CHECKOUT SESSION
-    # ========================================================
-
     session = event["data"]["object"]
-
-
-    # IMPORTANT:
-    #
-    # DO NOT USE:
-    #
-    # session.get(...)
-    #
-    # StripeObject does not support .get() in this environment.
-    #
-    # Use [] instead.
 
     session_id = session["id"]
 
-
-    # ========================================================
-    # 7. GET METADATA
-    # ========================================================
-
     metadata = session["metadata"]
 
-
-    # IMPORTANT:
-    #
-    # DO NOT USE:
-    #
-    # metadata.get(...)
-    #
-    # Use [] with existence checks instead.
 
     if "surgeon_id" in metadata:
         surgeon_id = metadata["surgeon_id"]
@@ -823,10 +764,6 @@ async def stripe_webhook(request: Request):
         scope_summary = "Unknown"
 
 
-    # ========================================================
-    # 8. LOG PAYMENT INFORMATION
-    # ========================================================
-
     logger.info(
         "Stripe checkout completed: %s",
         session_id
@@ -842,10 +779,6 @@ async def stripe_webhook(request: Request):
         postcode
     )
 
-
-    # ========================================================
-    # 9. PREVENT DUPLICATE WEBHOOK PROCESSING
-    # ========================================================
 
     if not mark_session_processed(session_id):
 
@@ -864,19 +797,11 @@ async def stripe_webhook(request: Request):
         }
 
 
-    # ========================================================
-    # 10. PAYMENT CONFIRMED
-    # ========================================================
-
     logger.info(
         "TEST PAYMENT COMPLETED for surgeon %s",
         surgeon_id
     )
 
-
-    # ========================================================
-    # 11. SEND TEST UNLOCK EMAIL
-    # ========================================================
 
     recipient = TEST_EMAIL
 
@@ -946,10 +871,6 @@ async def stripe_webhook(request: Request):
         )
 
 
-    # ========================================================
-    # 12. SUCCESS
-    # ========================================================
-
     logger.info(
         "TEST PAYMENT SUCCESSFULLY PROCESSED "
         "for surgeon %s",
@@ -974,6 +895,8 @@ async def stripe_webhook(request: Request):
         "postcode":
             postcode,
     }
+
+
 # ============================================================
 # REAL LEEDS COUNCIL DATA TEST
 # ============================================================
@@ -981,50 +904,370 @@ async def stripe_webhook(request: Request):
 @app.get("/test-leeds")
 def test_leeds():
 
-    import requests
+    logger.info(
+        "REAL LEEDS DATA TEST STARTED"
+    )
 
-    logger.info("REAL LEEDS DATA TEST STARTED")
 
-    url = "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query"
+    # --------------------------------------------------------
+    # Leeds City Council ArcGIS endpoint
+    # --------------------------------------------------------
+
+    url = (
+        "https://mapservices.leeds.gov.uk/"
+        "arcgis/rest/services/Public/Planning/"
+        "MapServer/12/query"
+    )
+
+
+    # --------------------------------------------------------
+    # STEP 1:
+    # Get a larger sample from the real Leeds dataset.
+    #
+    # We deliberately do NOT create Stripe sessions here.
+    # We deliberately do NOT send emails here.
+    # --------------------------------------------------------
 
     params = {
+
         "where": "1=1",
+
         "outFields": "*",
+
         "returnGeometry": "false",
-        "resultRecordCount": 20,
+
+        "resultRecordCount": 1000,
+
         "f": "json",
     }
 
+
     try:
-        response = requests.get(url, params=params, timeout=30)
+
+        response = requests.get(
+            url,
+            params=params,
+            timeout=30,
+        )
+
         response.raise_for_status()
 
         data = response.json()
 
-        if "error" in data:
-            logger.error("Leeds API returned an error: %s", data["error"])
-            raise HTTPException(
-                status_code=500,
-                detail=f"Leeds API error: {data['error']}"
-            )
-
-        features = data.get("features", [])
-
-        logger.info("Leeds returned %s applications", len(features))
-
-        return {
-            "status": "SUCCESS",
-            "source": "Leeds City Council",
-            "applications_found": len(features),
-            "applications": [
-                feature.get("attributes", {})
-                for feature in features
-            ],
-        }
 
     except Exception as exc:
-        logger.exception("Leeds data test failed")
+
+        logger.exception(
+            "Failed connecting to Leeds Council API"
+        )
+
         raise HTTPException(
             status_code=500,
-            detail=f"Leeds data test failed: {str(exc)}"
+            detail=(
+                "Could not connect to Leeds Council API: "
+                f"{str(exc)}"
+            )
         )
+
+
+    # --------------------------------------------------------
+    # STEP 2:
+    # Check for an ArcGIS error.
+    # --------------------------------------------------------
+
+    if "error" in data:
+
+        logger.error(
+            "Leeds API returned an error: %s",
+            data["error"]
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Leeds API error: {data['error']}"
+        )
+
+
+    features = data.get(
+        "features",
+        []
+    )
+
+
+    logger.info(
+        "Leeds returned %s records",
+        len(features)
+    )
+
+
+    # --------------------------------------------------------
+    # STEP 3:
+    # Convert ArcGIS records into ordinary dictionaries.
+    # --------------------------------------------------------
+
+    applications = []
+
+    for feature in features:
+
+        attributes = feature.get(
+            "attributes",
+            {}
+        )
+
+        applications.append(
+            attributes
+        )
+
+
+    # --------------------------------------------------------
+    # STEP 4:
+    # Work out the current date.
+    #
+    # We use UTC and look for records from approximately the
+    # last 3 years as an initial test.
+    #
+    # This is intentionally broad for the first real test.
+    # --------------------------------------------------------
+
+    now = datetime.now(timezone.utc)
+
+    cutoff_timestamp = (
+        now.timestamp() - (3 * 365 * 24 * 60 * 60)
+    ) * 1000
+
+
+    # --------------------------------------------------------
+    # STEP 5:
+    # Keep records with a reasonably recent decision/
+    # approval date.
+    #
+    # Leeds supplies these values as milliseconds since
+    # 1 January 1970.
+    # --------------------------------------------------------
+
+    recent_applications = []
+
+    for application in applications:
+
+        date_deciss = application.get(
+            "DATEDECISS"
+        )
+
+        date_appval = application.get(
+            "DATEAPVAL"
+        )
+
+        candidate_dates = []
+
+        if isinstance(
+            date_deciss,
+            (int, float)
+        ):
+            candidate_dates.append(
+                date_deciss
+            )
+
+        if isinstance(
+            date_appval,
+            (int, float)
+        ):
+            candidate_dates.append(
+                date_appval
+            )
+
+        is_recent = any(
+            date_value >= cutoff_timestamp
+            for date_value in candidate_dates
+        )
+
+        if is_recent:
+
+            recent_applications.append(
+                application
+            )
+
+
+    # --------------------------------------------------------
+    # STEP 6:
+    # Look for tree-related wording.
+    #
+    # This is NOT the final AI classification system.
+    # It is simply a transparent first filter so we can
+    # prove that the council data contains relevant jobs.
+    # --------------------------------------------------------
+
+    tree_keywords = [
+
+        "tree",
+        "trees",
+        "tpo",
+        "tree preservation",
+        "felling",
+        "fell",
+        "arbor",
+        "arboricultural",
+        "pruning",
+        "crown",
+        "woodland",
+        "hedge",
+    ]
+
+
+    tree_applications = []
+
+
+    for application in recent_applications:
+
+        proposal = str(
+            application.get(
+                "PROPOSAL",
+                ""
+            )
+        ).lower()
+
+        address = str(
+            application.get(
+                "ADDRESS",
+                ""
+            )
+        ).lower()
+
+        combined_text = (
+            proposal
+            + " "
+            + address
+        )
+
+
+        matched_keywords = [
+
+            keyword
+
+            for keyword in tree_keywords
+
+            if keyword in combined_text
+        ]
+
+
+        if matched_keywords:
+
+            result = dict(
+                application
+            )
+
+            result["matched_keywords"] = (
+                matched_keywords
+            )
+
+            tree_applications.append(
+                result
+            )
+
+
+    # --------------------------------------------------------
+    # STEP 7:
+    # Sort newest-looking records first.
+    # --------------------------------------------------------
+
+    tree_applications.sort(
+
+        key=lambda item: max(
+
+            [
+
+                value
+
+                for value in [
+
+                    item.get("DATEDECISS"),
+                    item.get("DATEAPVAL"),
+
+                ]
+
+                if isinstance(
+                    value,
+                    (int, float)
+                )
+
+            ]
+
+            or [0]
+
+        ),
+
+        reverse=True,
+    )
+
+
+    # --------------------------------------------------------
+    # STEP 8:
+    # Convert timestamps into readable dates.
+    # --------------------------------------------------------
+
+    for application in tree_applications:
+
+        for field in [
+            "DATEDECISS",
+            "DATEAPVAL",
+        ]:
+
+            value = application.get(
+                field
+            )
+
+            if isinstance(
+                value,
+                (int, float)
+            ):
+
+                try:
+
+                    application[
+                        f"{field}_readable"
+                    ] = datetime.fromtimestamp(
+                        value / 1000,
+                        tz=timezone.utc
+                    ).strftime(
+                        "%Y-%m-%d"
+                    )
+
+                except Exception:
+
+                    application[
+                        f"{field}_readable"
+                    ] = "Unknown"
+
+
+    # --------------------------------------------------------
+    # STEP 9:
+    # Return the test result.
+    #
+    # NOTHING BELOW THIS POINT creates payments or emails.
+    # --------------------------------------------------------
+
+    return {
+
+        "status":
+            "SUCCESS",
+
+        "source":
+            "Leeds City Council",
+
+        "test_mode":
+            True,
+
+        "records_downloaded":
+            len(applications),
+
+        "recent_records_found":
+            len(recent_applications),
+
+        "tree_related_records_found":
+            len(tree_applications),
+
+        "cutoff_date":
+            now.strftime("%Y-%m-%d"),
+
+        "tree_applications":
+            tree_applications[:100],
+    }
