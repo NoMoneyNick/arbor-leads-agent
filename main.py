@@ -29,41 +29,58 @@ def get_d(r):
     return float(v)
 
 def classify(r):
-    p = str(r.get("PROPOSAL") or "").lower()
+    p = str(r.get("PROPOSAL") or r.get("DESCRIPT") or "").lower()
     if not p: return False, 0
     m = [k for k in TREE_WORDS if k in p]
     s = len(m)
     if "tree" in p: s += 2
-    if any(x in p for x in ["fell", "remove", "crown"]): s += 5
+    if any(x in p for x in ["fell", "remove", "crown", "tpo"]): s += 5
     if any(w in p for w in SKIP_WORDS) and s < 7: return False, 0
-    return (s > 1), s
+    return (s > 0), s
 
 def fetch():
     h = {"User-Agent": "Mozilla/5.0 Chrome/121.0.0.0", "Referer": "https://www.leeds.gov.uk/"}
-    q = {"where": "1=1", "outFields": "*", "returnGeometry": "false", "resultRecordCount": 1000, "f": "json"}
+    # resultOffset=0 and orderByFields makes the server give us the LATEST records first
+    q = {
+        "where": "1=1",
+        "outFields": "*",
+        "returnGeometry": "false",
+        "resultRecordCount": 1000,
+        "orderByFields": "DATEAPVAL DESC",
+        "f": "json"
+    }
     try:
         res = requests.get(L_URL, params=q, headers=h, timeout=30)
         data = res.json()
-        recs = [f.get("attributes", {}) for f in data.get("features", [])]
-        recs.sort(key=lambda x: get_d(x), reverse=True)
-        return recs
+        return [f.get("attributes", {}) for f in data.get("features", [])]
     except: return []
 
 @app.get("/")
-def home(): return {"status": "V2.5 Active"}
+def home(): return {"status": "V2.6 Sorting Active"}
 
 @app.get("/test-leeds")
 def test():
     recs = fetch()
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=90)).timestamp() * 1000
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=120)).timestamp() * 1000
     leads = []
-    for r in recs:
+    samples = []
+    
+    for i, r in enumerate(recs):
+        if i < 5: # Capture first 5 for debugging
+            samples.append({"date": get_d(r), "text": r.get("PROPOSAL") or r.get("DESCRIPT")})
+            
         is_t, s = classify(r)
         if is_t and get_d(r) >= cutoff:
             r["_score"] = s
             r["_date"] = datetime.fromtimestamp(get_d(r)/1000, tz=timezone.utc).strftime("%Y-%m-%d")
             leads.append(r)
-    return {"scanned": len(recs), "found": len(leads), "leads": leads[:20]}
+            
+    return {
+        "council_count": len(recs),
+        "debug_samples": samples,
+        "leads_found": len(leads),
+        "leads": leads[:20]
+    }
 
 @app.get("/trigger-scrape")
 def scrape(x_trigger_secret: str = Header(default=None)):
@@ -75,15 +92,13 @@ def scrape(x_trigger_secret: str = Header(default=None)):
     found.sort(key=lambda x: classify(x)[1], reverse=True)
     best = found[0]
     
-    # AI
     ai = client.chat.completions.create(
         model="gpt-4o-mini", response_format={"type": "json_object"},
         messages=[{"role": "system", "content": "Return JSON: applicant_name, site_address, postcode, scope_summary, high_value (bool)"},
-                  {"role": "user", "content": f"Addr: {best.get('ADDRESS')} Prop: {best.get('PROPOSAL')}"}]
+                  {"role": "user", "content": f"Addr: {best.get('ADDRESS')} Prop: {best.get('PROPOSAL') or best.get('DESCRIPT')}"}]
     )
     ld = json.loads(ai.choices[0].message.content)
     
-    # Contractors
     cons = []
     if SURL:
         try:
