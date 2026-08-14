@@ -912,6 +912,14 @@ def test_leeds():
     # --------------------------------------------------------
     # Leeds City Council ArcGIS endpoint
     # --------------------------------------------------------
+# ============================================================
+# REAL LEEDS COUNCIL TREE APPLICATION TEST
+# ============================================================
+
+@app.get("/test-leeds")
+def test_leeds():
+
+    logger.info("REAL LEEDS TREE DATA TEST STARTED")
 
     url = (
         "https://mapservices.leeds.gov.uk/"
@@ -919,28 +927,56 @@ def test_leeds():
         "MapServer/12/query"
     )
 
+    # --------------------------------------------------------
+    # TREE-WORK KEYWORDS
+    # --------------------------------------------------------
+    #
+    # We deliberately search the PROPOSAL field rather than
+    # simply searching every field.
+    #
+    # This helps prevent unrelated applications being labelled
+    # as tree jobs just because the word "tree" appears
+    # somewhere else in the council data.
+    #
+
+    tree_keywords = [
+        "tree",
+        "trees",
+        "tree work",
+        "tree works",
+        "tree removal",
+        "tree removals",
+        "tree felling",
+        "felling",
+        "fell",
+        "pruning",
+        "prune",
+        "crown reduction",
+        "crown reduce",
+        "crown lift",
+        "crown lifting",
+        "dead tree",
+        "dead trees",
+        "arboricultural",
+        "arboriculture",
+        "tpo",
+        "tree preservation",
+        "section 211",
+        "s211",
+    ]
 
     # --------------------------------------------------------
-    # STEP 1:
-    # Get a larger sample from the real Leeds dataset.
-    #
-    # We deliberately do NOT create Stripe sessions here.
-    # We deliberately do NOT send emails here.
+    # GET RECENT LEEDS APPLICATIONS
     # --------------------------------------------------------
 
     params = {
-
         "where": "1=1",
-
         "outFields": "*",
-
         "returnGeometry": "false",
-
         "resultRecordCount": 1000,
-
+        "orderByFields": "DATEAPVAL DESC",
         "f": "json",
     }
-
 
     try:
 
@@ -954,296 +990,174 @@ def test_leeds():
 
         data = response.json()
 
-
     except Exception as exc:
 
         logger.exception(
-            "Failed connecting to Leeds Council API"
+            "Failed connecting to Leeds Council"
         )
 
         raise HTTPException(
             status_code=500,
-            detail=(
-                "Could not connect to Leeds Council API: "
-                f"{str(exc)}"
-            )
+            detail=f"Leeds Council connection failed: {str(exc)}",
         )
 
-
     # --------------------------------------------------------
-    # STEP 2:
-    # Check for an ArcGIS error.
+    # CHECK LEEDS RESPONSE
     # --------------------------------------------------------
 
     if "error" in data:
 
         logger.error(
             "Leeds API returned an error: %s",
-            data["error"]
+            data["error"],
         )
 
         raise HTTPException(
             status_code=500,
-            detail=f"Leeds API error: {data['error']}"
+            detail=f"Leeds API error: {data['error']}",
         )
 
-
-    features = data.get(
-        "features",
-        []
-    )
-
+    features = data.get("features", [])
 
     logger.info(
         "Leeds returned %s records",
-        len(features)
+        len(features),
     )
 
-
     # --------------------------------------------------------
-    # STEP 3:
-    # Convert ArcGIS records into ordinary dictionaries.
+    # SEARCH PROPOSALS FOR TREE WORK
     # --------------------------------------------------------
-
-    applications = []
-
-    for feature in features:
-
-        attributes = feature.get(
-            "attributes",
-            {}
-        )
-
-        applications.append(
-            attributes
-        )
-
-
-    # --------------------------------------------------------
-    # STEP 4:
-    # Work out the current date.
-    #
-    # We use UTC and look for records from approximately the
-    # last 3 years as an initial test.
-    #
-    # This is intentionally broad for the first real test.
-    # --------------------------------------------------------
-
-    now = datetime.now(timezone.utc)
-
-    cutoff_timestamp = (
-        now.timestamp() - (3 * 365 * 24 * 60 * 60)
-    ) * 1000
-
-
-    # --------------------------------------------------------
-    # STEP 5:
-    # Keep records with a reasonably recent decision/
-    # approval date.
-    #
-    # Leeds supplies these values as milliseconds since
-    # 1 January 1970.
-    # --------------------------------------------------------
-
-    recent_applications = []
-
-    for application in applications:
-
-        date_deciss = application.get(
-            "DATEDECISS"
-        )
-
-        date_appval = application.get(
-            "DATEAPVAL"
-        )
-
-        candidate_dates = []
-
-        if isinstance(
-            date_deciss,
-            (int, float)
-        ):
-            candidate_dates.append(
-                date_deciss
-            )
-
-        if isinstance(
-            date_appval,
-            (int, float)
-        ):
-            candidate_dates.append(
-                date_appval
-            )
-
-        is_recent = any(
-            date_value >= cutoff_timestamp
-            for date_value in candidate_dates
-        )
-
-        if is_recent:
-
-            recent_applications.append(
-                application
-            )
-
-
-    # --------------------------------------------------------
-    # STEP 6:
-    # Look for tree-related wording.
-    #
-    # This is NOT the final AI classification system.
-    # It is simply a transparent first filter so we can
-    # prove that the council data contains relevant jobs.
-    # --------------------------------------------------------
-
-    tree_keywords = [
-
-        "tree",
-        "trees",
-        "tpo",
-        "tree preservation",
-        "felling",
-        "fell",
-        "arbor",
-        "arboricultural",
-        "pruning",
-        "crown",
-        "woodland",
-        "hedge",
-    ]
-
 
     tree_applications = []
 
+    for feature in features:
 
-    for application in recent_applications:
+        attributes = feature.get("attributes", {})
 
-        proposal = str(
-            application.get(
-                "PROPOSAL",
-                ""
-            )
-        ).lower()
+        proposal = attributes.get("PROPOSAL") or ""
 
-        address = str(
-            application.get(
-                "ADDRESS",
-                ""
-            )
-        ).lower()
+        address = attributes.get("ADDRESS") or ""
 
-        combined_text = (
-            proposal
-            + " "
-            + address
-        )
+        reference = attributes.get("REFVAL") or ""
 
+        searchable_text = proposal.lower()
 
-        matched_keywords = [
+        matched_keywords = []
 
-            keyword
+        for keyword in tree_keywords:
 
-            for keyword in tree_keywords
+            if keyword.lower() in searchable_text:
 
-            if keyword in combined_text
-        ]
+                matched_keywords.append(keyword)
 
+        # ----------------------------------------------------
+        # ONLY KEEP APPLICATIONS WHERE THE PROPOSAL ITSELF
+        # CONTAINS A TREE-RELATED TERM
+        # ----------------------------------------------------
 
-        if matched_keywords:
+        if not matched_keywords:
 
-            result = dict(
-                application
-            )
+            continue
 
-            result["matched_keywords"] = (
-                matched_keywords
-            )
+        # ----------------------------------------------------
+        # DATE CONVERSION
+        # ----------------------------------------------------
 
-            tree_applications.append(
-                result
-            )
+        date_applied = attributes.get("DATEAPVAL")
 
+        date_decided = attributes.get("DATEDECISS")
 
-    # --------------------------------------------------------
-    # STEP 7:
-    # Sort newest-looking records first.
-    # --------------------------------------------------------
+        date_applied_readable = None
+        date_decided_readable = None
 
-    tree_applications.sort(
+        if date_applied:
 
-        key=lambda item: max(
+            try:
 
-            [
+                from datetime import datetime, timezone
 
-                value
-
-                for value in [
-
-                    item.get("DATEDECISS"),
-                    item.get("DATEAPVAL"),
-
-                ]
-
-                if isinstance(
-                    value,
-                    (int, float)
+                date_applied_readable = (
+                    datetime.fromtimestamp(
+                        date_applied / 1000,
+                        tz=timezone.utc,
+                    ).strftime("%Y-%m-%d")
                 )
 
-            ]
+            except Exception:
 
-            or [0]
+                date_applied_readable = None
 
-        ),
+        if date_decided:
 
-        reverse=True,
+            try:
+
+                from datetime import datetime, timezone
+
+                date_decided_readable = (
+                    datetime.fromtimestamp(
+                        date_decided / 1000,
+                        tz=timezone.utc,
+                    ).strftime("%Y-%m-%d")
+                )
+
+            except Exception:
+
+                date_decided_readable = None
+
+        # ----------------------------------------------------
+        # ADD MATCH
+        # ----------------------------------------------------
+
+        tree_applications.append({
+
+            "OBJECTID":
+                attributes.get("OBJECTID"),
+
+            "REFVAL":
+                reference,
+
+            "PROPOSAL":
+                proposal,
+
+            "DTYPNUMBCO":
+                attributes.get("DTYPNUMBCO"),
+
+            "DATEDECISS":
+                date_decided,
+
+            "DATEAPVAL":
+                date_applied,
+
+            "DATEDECISS_readable":
+                date_decided_readable,
+
+            "DATEAPVAL_readable":
+                date_applied_readable,
+
+            "DCSTAT":
+                attributes.get("DCSTAT"),
+
+            "DECSN":
+                attributes.get("DECSN"),
+
+            "DCAPPTYP":
+                attributes.get("DCAPPTYP"),
+
+            "ADDRESS":
+                address,
+
+            "matched_keywords":
+                matched_keywords,
+        })
+
+    # --------------------------------------------------------
+    # RETURN RESULTS
+    # --------------------------------------------------------
+
+    logger.info(
+        "Found %s tree-related applications",
+        len(tree_applications),
     )
-
-
-    # --------------------------------------------------------
-    # STEP 8:
-    # Convert timestamps into readable dates.
-    # --------------------------------------------------------
-
-    for application in tree_applications:
-
-        for field in [
-            "DATEDECISS",
-            "DATEAPVAL",
-        ]:
-
-            value = application.get(
-                field
-            )
-
-            if isinstance(
-                value,
-                (int, float)
-            ):
-
-                try:
-
-                    application[
-                        f"{field}_readable"
-                    ] = datetime.fromtimestamp(
-                        value / 1000,
-                        tz=timezone.utc
-                    ).strftime(
-                        "%Y-%m-%d"
-                    )
-
-                except Exception:
-
-                    application[
-                        f"{field}_readable"
-                    ] = "Unknown"
-
-
-    # --------------------------------------------------------
-    # STEP 9:
-    # Return the test result.
-    #
-    # NOTHING BELOW THIS POINT creates payments or emails.
-    # --------------------------------------------------------
 
     return {
 
@@ -1257,17 +1171,11 @@ def test_leeds():
             True,
 
         "records_downloaded":
-            len(applications),
-
-        "recent_records_found":
-            len(recent_applications),
+            len(features),
 
         "tree_related_records_found":
             len(tree_applications),
 
-        "cutoff_date":
-            now.strftime("%Y-%m-%d"),
-
         "tree_applications":
-            tree_applications[:100],
+            tree_applications,
     }
