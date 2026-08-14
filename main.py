@@ -1,17 +1,22 @@
 import os, json, logging, requests, psycopg2, stripe
 from datetime import datetime, timezone, timedelta
-from fastapi import FastAPI, Request, HTTPException, Header
+from fastapi import FastAPI, Request, HTTPException, Query
 from openai import OpenAI
 
-app = FastAPI()
+# Initialize FastAPI with the dashboard enabled
+app = FastAPI(title="Vector Data Labs Lead Agent", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
-# ENV
-OKEY, SURL = os.getenv("OPENAI_API_KEY"), os.getenv("SUPABASE_DB_URL")
-S_SEC, S_WH = os.getenv("STRIPE_SECRET_KEY"), os.getenv("STRIPE_WEBHOOK_SECRET")
-R_KEY, T_EM = os.getenv("RESEND_API_KEY"), os.getenv("TEST_EMAIL")
-T_SEC, P_URL = os.getenv("TRIGGER_SECRET"), os.getenv("PUBLIC_APP_URL")
+# ENVIRONMENT VARIABLES
+OKEY = os.getenv("OPENAI_API_KEY")
+SURL = os.getenv("SUPABASE_DB_URL")
+S_SEC = os.getenv("STRIPE_SECRET_KEY")
+S_WH = os.getenv("STRIPE_WEBHOOK_SECRET")
+R_KEY = os.getenv("RESEND_API_KEY")
+T_EM = os.getenv("TEST_EMAIL")
+T_SEC = os.getenv("TRIGGER_SECRET")
+P_URL = os.getenv("PUBLIC_APP_URL")
 
 R_URL = "https://api.resend.com/emails"
 L_URL = "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query"
@@ -20,89 +25,67 @@ client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# Expanded tree keywords
-TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "stump", "arboriculture", "conservation", "birch", "oak", "ash", "sycamore", "willow"]
-SKIP_WORDS = ["dwelling", "erection of", "new build"]
+# TREE SEARCH LOGIC
+TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "stump", "arboriculture", "conservation"]
+SKIP_WORDS = ["dwelling", "extension", "new build", "erection of"]
 
 def get_d(r):
-    # Try all known Leeds date fields
-    v = r.get("DATEAPVAL") or r.get("DATE_RECEIVED") or r.get("DATE_VALID") or r.get("DATEDECISS") or 0
+    v = r.get("DATEAPVAL") or r.get("DATE_RECEIVED") or 0
     return float(v)
 
 def classify(r):
-    p = str(r.get("PROPOSAL") or r.get("DESCRIPT") or "").lower()
+    p = str(r.get("PROPOSAL") or "").lower()
     if not p: return False, 0
     m = [k for k in TREE_WORDS if k in p]
     s = len(m)
     if "tree" in p: s += 2
-    if any(x in p for x in ["fell", "remove", "crown", "reduce", "thin"]): s += 5
-    is_bad = any(w in p for w in SKIP_WORDS)
-    if is_bad and s < 7: return False, 0
-    return (s > 0), s
+    if any(x in p for x in ["fell", "remove", "crown"]): s += 5
+    if any(w in p for w in SKIP_WORDS) and s < 7: return False, 0
+    return (s > 1), s
 
-def fetch():
+def fetch_leeds():
     h = {"User-Agent": "Mozilla/5.0 Chrome/121.0.0.0", "Referer": "https://www.leeds.gov.uk/"}
-    # We sort by OBJECTID DESC to get the newest entries first
-    q = {
-        "where": "1=1",
-        "outFields": "*",
-        "returnGeometry": "false",
-        "resultRecordCount": 1000,
-        "orderByFields": "OBJECTID DESC",
-        "f": "json"
-    }
+    q = {"where": "1=1", "outFields": "*", "returnGeometry": "false", "resultRecordCount": 1000, "orderByFields": "OBJECTID DESC", "f": "json"}
     try:
         res = requests.get(L_URL, params=q, headers=h, timeout=30)
         data = res.json()
         return [f.get("attributes", {}) for f in data.get("features", [])]
     except: return []
 
-@app.get("/")
-def home(): return {"status": "V2.7 ID-Sort Active"}
+# --- ROUTES ---
 
-@app.get("/test-leeds")
-def test():
-    recs = fetch()
-    # Looking for records in the last 6 months (Leeds updates can be slow)
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=180)).timestamp() * 1000
+@app.get("/", include_in_schema=False)
+def home(): return {"message": "Agent is running. Go to /docs for the dashboard."}
+
+@app.get("/test-leeds", tags=["Testing"])
+def test_leeds_connection():
+    """Download 1000 records and show the ones that look like tree jobs."""
+    recs = fetch_leeds()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=120)).timestamp() * 1000
     leads = []
-    samples = []
-    
-    for i, r in enumerate(recs):
-        d = get_d(r)
-        if i < 5:
-            samples.append({"id": r.get("OBJECTID"), "date": d, "text": r.get("PROPOSAL")})
-            
-        is_t, s = classify(r)
-        # If date is 0 but ID is very high, it's likely a brand new record not yet dated
-        if is_t and (d >= cutoff or d == 0):
-            r["_score"] = s
-            r["_date"] = datetime.fromtimestamp(d/1000, tz=timezone.utc).strftime("%Y-%m-%d") if d > 0 else "Pending"
-            leads.append(r)
-            
-    return {
-        "council_count": len(recs),
-        "debug_samples": samples,
-        "leads_found": len(leads),
-        "leads": leads[:30]
-    }
-
-@app.get("/trigger-scrape")
-def scrape(x_trigger_secret: str = Header(default=None)):
-    if x_trigger_secret != T_SEC: raise HTTPException(status_code=401)
-    recs = fetch()
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).timestamp() * 1000
-    found = []
     for r in recs:
-        d = get_d(r)
         is_t, s = classify(r)
-        if is_t and (d >= cutoff or d == 0):
+        if is_t and get_d(r) >= cutoff:
             r["_score"] = s
-            found.append(r)
-    if not found: return {"status": "no leads"}
-    found.sort(key=lambda x: x["_score"], reverse=True)
+            r["_date"] = datetime.fromtimestamp(get_d(r)/1000, tz=timezone.utc).strftime("%Y-%m-%d")
+            leads.append(r)
+    return {"scanned": len(recs), "found": len(leads), "leads": leads[:20]}
+
+@app.get("/trigger-scrape", tags=["Live Actions"])
+def trigger_scrape(secret: str = Query(..., description="Your TRIGGER_SECRET from Render")):
+    """Find the best tree lead from the last 30 days and send the email/payment link."""
+    if secret != T_SEC:
+        raise HTTPException(status_code=401, detail="Invalid Secret Key")
+        
+    recs = fetch_leeds()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).timestamp() * 1000
+    found = [r for r in recs if get_d(r) >= cutoff and classify(r)[0]]
+    if not found: return {"status": "no leads found in the last 30 days"}
+    
+    found.sort(key=lambda x: classify(x)[1], reverse=True)
     best = found[0]
     
+    # AI EXTRACTION
     ai = client.chat.completions.create(
         model="gpt-4o-mini", response_format={"type": "json_object"},
         messages=[{"role": "system", "content": "Return JSON: applicant_name, site_address, postcode, scope_summary, high_value (bool)"},
@@ -110,6 +93,7 @@ def scrape(x_trigger_secret: str = Header(default=None)):
     )
     ld = json.loads(ai.choices[0].message.content)
     
+    # GET CONTRACTORS
     cons = []
     if SURL:
         try:
@@ -121,6 +105,7 @@ def scrape(x_trigger_secret: str = Header(default=None)):
         except: pass
     if not cons: cons.append({"id": 1, "email": T_EM})
     
+    # SEND STRIPE LINKS
     for cn in cons:
         amt = 4500 if ld.get("high_value") else 2500
         sess = stripe.checkout.Session.create(
@@ -129,11 +114,12 @@ def scrape(x_trigger_secret: str = Header(default=None)):
             mode="payment", success_url=f"{P_URL}/payment-success", cancel_url=f"{P_URL}/payment-cancelled",
             metadata={"surgeon_id": str(cn["id"]), "ref": best.get("REFVAL", ""), "site_address": ld.get("site_address", "")}
         )
-        requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [cn["email"]], "subject": "New Lead", "text": f"Job: {ld['scope_summary']}. Link: {sess.url}"}, headers={"Authorization": f"Bearer {R_KEY}"})
-    return {"status": "sent"}
+        requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [cn["email"]], "subject": "New Tree Lead", "text": f"Job: {ld['scope_summary']}. Buy now: {sess.url}"}, headers={"Authorization": f"Bearer {R_KEY}", "Content-Type": "application/json"})
+    
+    return {"status": "sent", "lead_address": ld["site_address"]}
 
-@app.post("/webhook")
-async def webhook(req: Request):
+@app.post("/webhook", include_in_schema=False)
+async def stripe_webhook(req: Request):
     sig, payload = req.headers.get("stripe-signature"), await req.body()
     try:
         event = stripe.Webhook.construct_event(payload, sig, S_WH)
@@ -142,12 +128,12 @@ async def webhook(req: Request):
             if sess["id"] not in _processed:
                 _processed.add(sess["id"])
                 m = sess["metadata"]
-                requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [T_EM], "subject": "Paid!", "text": f"PAID: {m.get('site_address')}"}, headers={"Authorization": f"Bearer {R_KEY}"})
+                requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [T_EM], "subject": "Lead Paid!", "text": f"PAID: {m.get('site_address')}"}, headers={"Authorization": f"Bearer {R_KEY}", "Content-Type": "application/json"})
     except: pass
     return {"status": "ok"}
 
-@app.get("/payment-success")
+@app.get("/payment-success", include_in_schema=False)
 def success(): return {"message": "Success"}
 
-@app.get("/payment-cancelled")
+@app.get("/payment-cancelled", include_in_schema=False)
 def cancel(): return {"message": "Cancelled"}
