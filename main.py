@@ -3,20 +3,15 @@ from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, HTTPException, Query
 from openai import OpenAI
 
-# Initialize FastAPI with the dashboard enabled
-app = FastAPI(title="Vector Data Labs Lead Agent", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
-# ENVIRONMENT VARIABLES
-OKEY = os.getenv("OPENAI_API_KEY")
-SURL = os.getenv("SUPABASE_DB_URL")
-S_SEC = os.getenv("STRIPE_SECRET_KEY")
-S_WH = os.getenv("STRIPE_WEBHOOK_SECRET")
-R_KEY = os.getenv("RESEND_API_KEY")
-T_EM = os.getenv("TEST_EMAIL")
-T_SEC = os.getenv("TRIGGER_SECRET")
-P_URL = os.getenv("PUBLIC_APP_URL")
+# ENV
+OKEY, SURL = os.getenv("OPENAI_API_KEY"), os.getenv("SUPABASE_DB_URL")
+S_SEC, S_WH = os.getenv("STRIPE_SECRET_KEY"), os.getenv("STRIPE_WEBHOOK_SECRET")
+R_KEY, T_EM = os.getenv("RESEND_API_KEY"), os.getenv("TEST_EMAIL")
+T_SEC, P_URL = os.getenv("TRIGGER_SECRET"), os.getenv("PUBLIC_APP_URL")
 
 R_URL = "https://api.resend.com/emails"
 L_URL = "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query"
@@ -25,7 +20,7 @@ client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# TREE SEARCH LOGIC
+# LOGIC
 TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "stump", "arboriculture", "conservation"]
 SKIP_WORDS = ["dwelling", "extension", "new build", "erection of"]
 
@@ -43,7 +38,7 @@ def classify(r):
     if any(w in p for w in SKIP_WORDS) and s < 7: return False, 0
     return (s > 1), s
 
-def fetch_leeds():
+def fetch():
     h = {"User-Agent": "Mozilla/5.0 Chrome/121.0.0.0", "Referer": "https://www.leeds.gov.uk/"}
     q = {"where": "1=1", "outFields": "*", "returnGeometry": "false", "resultRecordCount": 1000, "orderByFields": "OBJECTID DESC", "f": "json"}
     try:
@@ -52,40 +47,74 @@ def fetch_leeds():
         return [f.get("attributes", {}) for f in data.get("features", [])]
     except: return []
 
+# --- BEAUTIFUL EMAIL TEMPLATES ---
+
+def send_email(to, subject, html_content):
+    payload = {
+        "from": "Vector Data Labs <onboarding@resend.dev>",
+        "to": [to],
+        "subject": subject,
+        "html": html_content
+    }
+    requests.post(R_URL, json=payload, headers={"Authorization": f"Bearer {R_KEY}", "Content-Type": "application/json"})
+
+def get_lead_alert_html(cn_name, ld, url):
+    return f"""
+    <div style="font-family: sans-serif; max-width: 600px; border: 1px solid #eee; padding: 20px;">
+        <h2 style="color: #2e7d32;">New Tree Lead Found</h2>
+        <p>Hello {cn_name}, we have identified a new high-quality tree lead in your area.</p>
+        <hr style="border: 0; border-top: 1px solid #eee;" />
+        <p><strong>Work Scope:</strong><br/>{ld['scope_summary']}</p>
+        <p><strong>Location:</strong> {ld['postcode']}</p>
+        <p><strong>Value:</strong> {'High Value Project' if ld['high_value'] else 'Standard Project'}</p>
+        <div style="margin-top: 30px;">
+            <a href="{url}" style="background-color: #2e7d32; color: white; padding: 12px 25px; text-decoration: none; border-radius: 5px; font-weight: bold;">Buy Exclusive Lead Now</a>
+        </div>
+        <p style="font-size: 12px; color: #666; margin-top: 30px;">Vector Data Labs - Leeds Council Planning Feed</p>
+    </div>
+    """
+
+def get_unlock_html(m):
+    return f"""
+    <div style="font-family: sans-serif; max-width: 600px; border: 1px solid #eee; padding: 20px; background-color: #f9f9f9;">
+        <h2 style="color: #1565c0;">Lead Unlocked</h2>
+        <p>You have successfully purchased the following lead. You can now contact the applicant or visit the site.</p>
+        <div style="background-color: white; padding: 15px; border-radius: 5px; border-left: 5px solid #1565c0;">
+            <p><strong>Site Address:</strong><br/>{m.get('site_address')}</p>
+            <p><strong>Applicant Name:</strong><br/>{m.get('applicant_name', 'Available on Public Record')}</p>
+            <p><strong>Ref:</strong> {m.get('ref')}</p>
+        </div>
+        <p style="font-size: 12px; color: #666; margin-top: 30px;">Thank you for using Vector Data Labs.</p>
+    </div>
+    """
+
 # --- ROUTES ---
 
 @app.get("/", include_in_schema=False)
-def home(): return {"message": "Agent is running. Go to /docs for the dashboard."}
+def home(): return {"message": "Active. Go to /docs"}
 
 @app.get("/test-leeds", tags=["Testing"])
-def test_leeds_connection():
-    """Download 1000 records and show the ones that look like tree jobs."""
-    recs = fetch_leeds()
+def test():
+    recs = fetch()
     cutoff = (datetime.now(timezone.utc) - timedelta(days=120)).timestamp() * 1000
     leads = []
     for r in recs:
         is_t, s = classify(r)
         if is_t and get_d(r) >= cutoff:
             r["_score"] = s
-            r["_date"] = datetime.fromtimestamp(get_d(r)/1000, tz=timezone.utc).strftime("%Y-%m-%d")
             leads.append(r)
     return {"scanned": len(recs), "found": len(leads), "leads": leads[:20]}
 
-@app.get("/trigger-scrape", tags=["Live Actions"])
-def trigger_scrape(secret: str = Query(..., description="Your TRIGGER_SECRET from Render")):
-    """Find the best tree lead from the last 30 days and send the email/payment link."""
-    if secret != T_SEC:
-        raise HTTPException(status_code=401, detail="Invalid Secret Key")
-        
-    recs = fetch_leeds()
+@app.get("/trigger-scrape", tags=["Live"])
+def scrape(secret: str = Query(..., description="Your secret key")):
+    if secret != T_SEC: raise HTTPException(status_code=401)
+    recs = fetch()
     cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).timestamp() * 1000
     found = [r for r in recs if get_d(r) >= cutoff and classify(r)[0]]
-    if not found: return {"status": "no leads found in the last 30 days"}
-    
+    if not found: return {"status": "no leads"}
     found.sort(key=lambda x: classify(x)[1], reverse=True)
     best = found[0]
     
-    # AI EXTRACTION
     ai = client.chat.completions.create(
         model="gpt-4o-mini", response_format={"type": "json_object"},
         messages=[{"role": "system", "content": "Return JSON: applicant_name, site_address, postcode, scope_summary, high_value (bool)"},
@@ -93,33 +122,33 @@ def trigger_scrape(secret: str = Query(..., description="Your TRIGGER_SECRET fro
     )
     ld = json.loads(ai.choices[0].message.content)
     
-    # GET CONTRACTORS
     cons = []
     if SURL:
         try:
             db = psycopg2.connect(SURL)
             with db.cursor() as c:
-                c.execute("SELECT id, email FROM tree_surgeons WHERE active IS TRUE")
-                for row in c.fetchall(): cons.append({"id": row[0], "email": row[1]})
+                c.execute("SELECT id, business_name, email FROM tree_surgeons WHERE active IS TRUE")
+                for row in c.fetchall(): cons.append({"id": row[0], "name": row[1], "email": row[2]})
             db.close()
         except: pass
-    if not cons: cons.append({"id": 1, "email": T_EM})
+    if not cons: cons.append({"id": 1, "name": "Test User", "email": T_EM})
     
-    # SEND STRIPE LINKS
     for cn in cons:
         amt = 4500 if ld.get("high_value") else 2500
         sess = stripe.checkout.Session.create(
             payment_method_types=["card"],
             line_items=[{"price_data": {"currency": "gbp", "product_data": {"name": "Tree Lead"}, "unit_amount": amt}, "quantity": 1}],
             mode="payment", success_url=f"{P_URL}/payment-success", cancel_url=f"{P_URL}/payment-cancelled",
-            metadata={"surgeon_id": str(cn["id"]), "ref": best.get("REFVAL", ""), "site_address": ld.get("site_address", "")}
+            metadata={"surgeon_id": str(cn["id"]), "ref": best.get("REFVAL", ""), "site_address": ld.get("site_address", ""), "applicant_name": ld.get("applicant_name", "")}
         )
-        requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [cn["email"]], "subject": "New Tree Lead", "text": f"Job: {ld['scope_summary']}. Buy now: {sess.url}"}, headers={"Authorization": f"Bearer {R_KEY}", "Content-Type": "application/json"})
-    
-    return {"status": "sent", "lead_address": ld["site_address"]}
+        # Send pretty HTML email
+        html = get_lead_alert_html(cn["name"], ld, sess.url)
+        send_email(cn["email"], f"New Tree Lead: {ld.get('postcode')}", html)
+
+    return {"status": "sent", "address": ld["site_address"]}
 
 @app.post("/webhook", include_in_schema=False)
-async def stripe_webhook(req: Request):
+async def webhook(req: Request):
     sig, payload = req.headers.get("stripe-signature"), await req.body()
     try:
         event = stripe.Webhook.construct_event(payload, sig, S_WH)
@@ -127,8 +156,9 @@ async def stripe_webhook(req: Request):
             sess = event["data"]["object"]
             if sess["id"] not in _processed:
                 _processed.add(sess["id"])
-                m = sess["metadata"]
-                requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [T_EM], "subject": "Lead Paid!", "text": f"PAID: {m.get('site_address')}"}, headers={"Authorization": f"Bearer {R_KEY}", "Content-Type": "application/json"})
+                # Send pretty unlock email
+                html = get_unlock_html(sess["metadata"])
+                send_email(T_EM, "Lead Unlocked - Action Required", html)
     except: pass
     return {"status": "ok"}
 
