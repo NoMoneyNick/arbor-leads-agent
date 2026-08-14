@@ -25,7 +25,7 @@ TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "st
 SKIP_WORDS = ["dwelling", "erection of", "new build", "conversion"]
 
 def get_d(r):
-    v = r.get("DATEAPVAL") or r.get("DATE_RECEIVED") or 0
+    v = r.get("DATEAPVAL") or r.get("DATE_RECEIVED") or r.get("DATE_VALID") or 0
     return float(v)
 
 def classify(r):
@@ -43,67 +43,49 @@ def fetch():
     q = {"where": "1=1", "outFields": "*", "returnGeometry": "false", "resultRecordCount": 1000, "orderByFields": "OBJECTID DESC", "f": "json"}
     try:
         res = requests.get(L_URL, params=q, headers=h, timeout=30)
-        data = res.json()
-        return [f.get("attributes", {}) for f in data.get("features", [])]
+        return [f.get("attributes", {}) for f in res.json().get("features", [])]
     except: return []
 
-# --- EMAILS ---
+# --- EMAILS WITH LOGGING ---
 
 def send_email(to, subject, html):
-    payload = {"from": "Vector Data Labs <onboarding@resend.dev>", "to": [to], "subject": subject, "html": html}
-    requests.post(R_URL, json=payload, headers={"Authorization": f"Bearer {R_KEY}", "Content-Type": "application/json"})
+    if not R_KEY:
+        logger.error("RESEND_API_KEY IS MISSING IN RENDER!")
+        return
+    
+    payload = {"from": "onboarding@resend.dev", "to": [to], "subject": subject, "html": html}
+    headers = {"Authorization": f"Bearer {R_KEY}", "Content-Type": "application/json"}
+    
+    try:
+        r = requests.post(R_URL, json=payload, headers=headers, timeout=10)
+        logger.info(f"Resend Response: {r.status_code} - {r.text}")
+        r.raise_for_status()
+    except Exception as e:
+        logger.error(f"Email failed to send: {str(e)}")
 
 def get_lead_alert_html(cn_name, ld, url):
-    # Clean up any weird symbols in the proposal text
-    clean_summary = ld['scope_summary'].replace('\r', '<br/>').replace('\n', '<br/>')
-    return f"""
-    <div style="font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; max-width: 600px; margin: auto; border: 1px solid #e0e0e0; border-radius: 8px; overflow: hidden;">
-        <div style="background-color: #2e7d32; padding: 20px; text-align: center;">
-            <h1 style="color: white; margin: 0; font-size: 22px;">New Tree Lead Found</h1>
-        </div>
-        <div style="padding: 30px; color: #333; line-height: 1.6;">
-            <p>Hello {cn_name},</p>
-            <p>We've identified a new planning application that requires specialist arboricultural work.</p>
-            <div style="background-color: #f5f5f5; padding: 20px; border-radius: 5px; margin: 20px 0;">
-                <p style="margin: 0;"><strong>Work Required:</strong><br/>{clean_summary}</p>
-                <p style="margin: 15px 0 0 0;"><strong>Location:</strong> {ld['postcode']}</p>
-            </div>
-            <div style="text-align: center; margin-top: 30px;">
-                <a href="{url}" style="background-color: #2e7d32; color: white; padding: 14px 30px; text-decoration: none; border-radius: 5px; font-weight: bold; display: inline-block;">Purchase Exclusive Lead</a>
-                <p style="font-size: 12px; color: #888; margin-top: 15px;">Secure payment via Stripe. One buyer only.</p>
-            </div>
-        </div>
-        <div style="background-color: #f9f9f9; padding: 15px; text-align: center; border-top: 1px solid #eee; font-size: 12px; color: #999;">
-            Vector Data Labs - Real-time Leeds Council Planning Alerts
-        </div>
-    </div>
-    """
+    clean_sum = ld['scope_summary'].replace('\r', '<br/>').replace('\n', '<br/>')
+    return f"""<div style="font-family:sans-serif;max-width:600px;margin:auto;border:1px solid #eee;padding:20px;">
+    <h2 style="color:#2e7d32;">New Tree Lead</h2><p>Hello {cn_name},</p>
+    <div style="background:#f5f5f5;padding:15px;border-radius:5px;">
+    <p><strong>Work:</strong><br/>{clean_sum}</p>
+    <p><strong>Location:</strong> {ld['postcode']}</p></div>
+    <p style="text-align:center;margin-top:25px;">
+    <a href="{url}" style="background:#2e7d32;color:white;padding:12px 25px;text-decoration:none;border-radius:5px;font-weight:bold;display:inline-block;">View & Buy Lead</a></p>
+    <p style="font-size:11px;color:#999;margin-top:20px;">Vector Data Labs - Leeds Council Planning</p></div>"""
 
 def get_unlock_html(m):
-    return f"""
-    <div style="font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; max-width: 600px; margin: auto; border: 1px solid #e0e0e0; border-radius: 8px; overflow: hidden;">
-        <div style="background-color: #1565c0; padding: 20px; text-align: center;">
-            <h1 style="color: white; margin: 0; font-size: 22px;">Lead Details Unlocked</h1>
-        </div>
-        <div style="padding: 30px; color: #333; line-height: 1.6;">
-            <p>Your purchase was successful. Here are the contact and site details:</p>
-            <div style="border: 1px solid #1565c0; padding: 20px; border-radius: 5px; margin: 20px 0;">
-                <p style="margin: 0;"><strong>Site Address:</strong><br/>{m.get('site_address')}</p>
-                <p style="margin: 15px 0 0 0;"><strong>Applicant Name:</strong><br/>{m.get('applicant_name') or 'Visit Site'}</p>
-                <p style="margin: 15px 0 0 0;"><strong>Council Reference:</strong> {m.get('ref')}</p>
-            </div>
-            <p>We recommend visiting the site or writing to the applicant immediately while the lead is fresh.</p>
-        </div>
-        <div style="background-color: #f9f9f9; padding: 15px; text-align: center; border-top: 1px solid #eee; font-size: 12px; color: #999;">
-            Vector Data Labs Purchase Receipt
-        </div>
-    </div>
-    """
+    return f"""<div style="font-family:sans-serif;max-width:600px;margin:auto;border:1px solid #eee;padding:20px;">
+    <h2 style="color:#1565c0;">Lead Unlocked</h2>
+    <div style="border:1px solid #1565c0;padding:15px;border-radius:5px;">
+    <p><strong>Address:</strong><br/>{m.get('site_address')}</p>
+    <p><strong>Applicant:</strong><br/>{m.get('applicant_name') or 'Check Council Portal'}</p>
+    <p><strong>Ref:</strong> {m.get('ref')}</p></div></div>"""
 
 # --- ROUTES ---
 
 @app.get("/", include_in_schema=False)
-def home(): return {"message": "Go to /docs"}
+def home(): return {"message": "Active. Go to /docs"}
 
 @app.get("/test-leeds", tags=["Testing"])
 def test():
@@ -115,7 +97,7 @@ def test():
         if is_t and get_d(r) >= cutoff:
             r["_score"] = s
             leads.append(r)
-    return {"council_count": len(recs), "leads_found": len(leads), "leads": leads[:20]}
+    return {"scanned": len(recs), "found": len(leads), "leads": leads[:20]}
 
 @app.get("/trigger-scrape", tags=["Live"])
 def scrape(secret: str = Query(..., description="Your secret key")):
@@ -123,7 +105,7 @@ def scrape(secret: str = Query(..., description="Your secret key")):
     recs = fetch()
     cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).timestamp() * 1000
     found = [r for r in recs if get_d(r) >= cutoff and classify(r)[0]]
-    if not found: return {"status": "no leads"}
+    if not found: return {"status": "no leads found in last 30 days"}
     found.sort(key=lambda x: classify(x)[1], reverse=True)
     best = found[0]
     
@@ -154,7 +136,7 @@ def scrape(secret: str = Query(..., description="Your secret key")):
             metadata={"surgeon_id": str(cn["id"]), "ref": best.get("REFVAL", ""), "site_address": ld.get("site_address", ""), "applicant_name": ld.get("applicant_name", "")}
         )
         html = get_lead_alert_html(cn["name"], ld, sess.url)
-        send_email(cn["email"], f"New Tree Job Opportunity: {ld.get('postcode')}", html)
+        send_email(cn["email"], f"New Tree Job: {ld.get('postcode')}", html)
     return {"status": "sent", "address": ld["site_address"]}
 
 @app.post("/webhook", include_in_schema=False)
@@ -167,7 +149,7 @@ async def webhook(req: Request):
             if sess["id"] not in _processed:
                 _processed.add(sess["id"])
                 html = get_unlock_html(sess["metadata"])
-                send_email(T_EM, "Lead Unlocked - Site Details Inside", html)
+                send_email(T_EM, "Lead Unlocked - Site Details", html)
     except: pass
     return {"status": "ok"}
 
