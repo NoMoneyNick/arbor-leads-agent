@@ -11,7 +11,7 @@ import stripe
 
 
 # ============================================================
-# VECTOR DATA LABS - LEEDS PRODUCTION VERSION 1.2
+# VECTOR DATA LABS - LEEDS PRODUCTION VERSION 1.3
 # ============================================================
 
 app = FastAPI()
@@ -36,10 +36,10 @@ PUBLIC_APP_URL = os.getenv("PUBLIC_APP_URL")
 
 RESEND_URL = "https://api.resend.com/emails"
 
-# Layer 12 is the most reliable for Leeds Planning
+# We switch to Layer 1 (Recent Planning Applications) - Much more stable
 LEEDS_PLANNING_URL = (
     "https://mapservices.leeds.gov.uk/"
-    "arcgis/rest/services/Public/Planning/MapServer/12/query"
+    "arcgis/rest/services/Public/Planning/MapServer/1/query"
 )
 
 # ============================================================
@@ -63,9 +63,6 @@ STRONG_TREE_KEYWORDS = [
     "sycamore", "oak", "ash dieback", "conifer", "beech", "birch"
 ]
 
-# Words that usually mean it's NOT a tree job
-SKIP_WORDS = ["dwelling", "erection of", "extension", "new build", "apartments"]
-
 # ============================================================
 # HELPERS
 # ============================================================
@@ -73,63 +70,48 @@ SKIP_WORDS = ["dwelling", "erection of", "extension", "new build", "apartments"]
 def safe_string(value):
     return str(value).strip() if value else ""
 
-def milliseconds_to_date(value):
-    if not value: return None
-    try:
-        return datetime.fromtimestamp(float(value) / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
-    except: return None
-
 def classify_tree_application(record):
-    """Determines if a record is actually about trees."""
     proposal = safe_string(record.get("PROPOSAL")).lower()
-    
     if not proposal:
-        return {"is_tree_related": False, "score": 0, "matched": []}
+        return {"is_tree_related": False, "score": 0}
 
     matched = [k for k in STRONG_TREE_KEYWORDS if k in proposal]
-    negatives = [n for n in SKIP_WORDS if n in proposal]
-
     score = len(matched) * 2
     
-    # Significant tree work bonuses
     if any(word in proposal for word in ["fell", "felling", "remove", "removal"]):
         score += 5
     if "tpo" in proposal or "preservation order" in proposal:
         score += 5
 
-    # If it mentions construction but also trees, we only take it if the score is very high
-    is_tree_related = score >= 4
-    if negatives and score < 10:
-        is_tree_related = False
-
     return {
-        "is_tree_related": is_tree_related,
+        "is_tree_related": score >= 5,
         "score": score,
         "matched": matched
     }
 
 # ============================================================
-# DATA FETCHING (DUMB FETCH + SMART FILTER)
+# DATA FETCHING (STABLE VERSION)
 # ============================================================
 
-def fetch_leeds_records(max_records=500):
+def fetch_leeds_records(max_records=200):
     """
-    Fetches the newest records from Leeds without a complex date filter
-    to avoid 400 errors from their server.
+    Fetches records using a very lightweight query to prevent 400 errors.
     """
+    # We only ask for the fields we absolutely need
+    fields = "REFVAL,ADDRESS,PROPOSAL,DATEAPVAL,APPNAME"
+
     params = {
-        "where": "1=1", # Get everything
-        "outFields": "*",
+        "where": "1=1",
+        "outFields": fields,
         "returnGeometry": "false",
         "resultRecordCount": max_records,
-        "orderByFields": "DATEAPVAL DESC", # Newest first
         "f": "json",
     }
 
-    logger.info("Fetching the 500 newest records from Leeds Council...")
+    logger.info("Requesting lightweight data from Leeds Layer 1...")
     
     try:
-        response = requests.get(LEEDS_PLANNING_URL, params=params, timeout=30)
+        response = requests.get(LEEDS_PLANNING_URL, params=params, timeout=20)
         response.raise_for_status()
         data = response.json()
 
@@ -138,7 +120,11 @@ def fetch_leeds_records(max_records=500):
             return []
 
         features = data.get("features", [])
-        return [f.get("attributes", {}) for f in features]
+        records = [f.get("attributes", {}) for f in features]
+        
+        # Sort them by date manually (newest first)
+        records.sort(key=lambda x: x.get("DATEAPVAL", 0), reverse=True)
+        return records
 
     except Exception as e:
         logger.error(f"Fetch failed: {e}")
@@ -150,37 +136,33 @@ def fetch_leeds_records(max_records=500):
 
 @app.get("/")
 def health_check():
-    return {"status": "Leeds Tree Agent Version 1.2 Active"}
+    return {"status": "Leeds Tree Agent V1.3 Active"}
 
 @app.get("/test-leeds")
 def test_leeds():
-    # 1. Get raw records
-    raw_records = fetch_leeds_records(max_records=500)
+    raw_records = fetch_leeds_records(max_records=200)
     
-    # 2. Filter by date (last 60 days) in our own code
-    cutoff_date = datetime.now(timezone.utc) - timedelta(days=60)
+    # Only keep things from the last 90 days
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=90)
     
     valid_leads = []
-    
     for r in raw_records:
-        # Get the date of the application
         ms = r.get("DATEAPVAL")
         if not ms: continue
         
         app_date = datetime.fromtimestamp(float(ms) / 1000, tz=timezone.utc)
         
-        # Only process if it's within 60 days
         if app_date > cutoff_date:
             classification = classify_tree_application(r)
             if classification["is_tree_related"]:
-                r["_ai_score"] = classification["score"]
-                r["_matched_keywords"] = classification["matched"]
-                r["_readable_date"] = app_date.strftime("%Y-%m-%d")
+                r["_score"] = classification["score"]
+                r["_matched"] = classification["matched"]
+                r["_date"] = app_date.strftime("%Y-%m-%d")
                 valid_leads.append(r)
 
     return {
-        "records_scanned": len(raw_records),
-        "tree_leads_found_last_60_days": len(valid_leads),
+        "records_fetched": len(raw_records),
+        "tree_leads_found": len(valid_leads),
         "leads": valid_leads
     }
 
@@ -189,8 +171,7 @@ def trigger_scrape(x_trigger_secret: str = Header(default=None)):
     if not TRIGGER_SECRET or x_trigger_secret != TRIGGER_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # Get records and filter
-    raw_records = fetch_leeds_records(max_records=200)
+    raw_records = fetch_leeds_records(max_records=100)
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=30)
     
     tree_apps = []
@@ -204,28 +185,25 @@ def trigger_scrape(x_trigger_secret: str = Header(default=None)):
                 tree_apps.append(r)
 
     if not tree_apps:
-        return {"status": "No tree leads found today."}
+        return {"status": "No leads today"}
 
-    # Process only the highest scoring lead
+    # Process best lead
     tree_apps.sort(key=lambda x: x["_score"], reverse=True)
-    selected_record = tree_apps[0]
+    best = tree_apps[0]
     
-    lead = extract_lead_with_openai(selected_record)
+    lead_data = extract_lead_with_openai(best)
     contractors = get_test_contractors()
-    results = []
-
+    
     for c in contractors:
         try:
-            session = create_test_checkout(c, lead, selected_record.get("REFVAL"))
-            send_tree_lead_email(c, lead, selected_record.get("REFVAL"), session)
-            results.append({"contractor": c["name"], "status": "sent"})
-        except Exception as e:
-            results.append({"contractor": c["name"], "status": "failed", "error": str(e)})
+            session = create_test_checkout(c, lead_data, best.get("REFVAL"))
+            send_tree_lead_email(c, lead_data, best.get("REFVAL"), session)
+        except: pass
 
-    return {"status": "Complete", "lead": lead["site_address"], "results": results}
+    return {"status": "Lead sent", "address": lead_data["site_address"]}
 
 # ============================================================
-# STABLE UTILITIES (AI, STRIPE, EMAIL)
+# STABLE UTILITIES
 # ============================================================
 
 def extract_lead_with_openai(record):
@@ -257,7 +235,7 @@ def create_test_checkout(contractor, lead, ref):
     )
 
 def send_tree_lead_email(contractor, lead, ref, session):
-    body = f"Hi {contractor['name']},\n\nNew Tree Job in {lead.get('postcode')}:\n{lead['scope_summary']}\n\nView Details & Buy: {session.url}"
+    body = f"Hi {contractor['name']},\n\nNew Tree Job in {lead.get('postcode')}:\n{lead['scope_summary']}\n\nLink: {session.url}"
     payload = {"from": "Vector Data Labs <onboarding@resend.dev>", "to": [contractor["email"]], "subject": f"New Lead: {ref}", "text": body}
     requests.post(RESEND_URL, json=payload, headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"})
 
@@ -284,16 +262,4 @@ async def stripe_webhook(request: Request):
         event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
         if event["type"] == "checkout.session.completed":
             session = event["data"]["object"]
-            if session["id"] not in _processed_sessions_memory:
-                _processed_sessions_memory.add(session["id"])
-                m = session["metadata"]
-                msg = f"UNLOCKED: {m['application_reference']}\nAddress: {m['site_address']}"
-                requests.post(RESEND_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [TEST_EMAIL], "subject": "Lead Paid!", "text": msg}, headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"})
-    except: pass
-    return {"status": "success"}
-
-@app.get("/payment-success")
-def payment_success(): return {"message": "Success"}
-
-@app.get("/payment-cancelled")
-def payment_cancelled(): return {"message": "Cancelled"}
+            if s
