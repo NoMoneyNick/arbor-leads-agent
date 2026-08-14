@@ -974,3 +974,57 @@ async def stripe_webhook(request: Request):
         "postcode":
             postcode,
     }
+# ============================================================
+# REAL LEEDS COUNCIL DATA TEST
+# ============================================================
+
+@app.get("/test-leeds")
+def test_leeds():
+
+    import requests
+
+    logger.info("REAL LEEDS DATA TEST STARTED")
+
+    url = "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query"
+
+    params = {
+        "where": "1=1",
+        "outFields": "*",
+        "returnGeometry": "false",
+        "resultRecordCount": 20,
+        "f": "json",
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+
+        data = response.json()
+
+        if "error" in data:
+            logger.error("Leeds API returned an error: %s", data["error"])
+            raise HTTPException(
+                status_code=500,
+                detail=f"Leeds API error: {data['error']}"
+            )
+
+        features = data.get("features", [])
+
+        logger.info("Leeds returned %s applications", len(features))
+
+        return {
+            "status": "SUCCESS",
+            "source": "Leeds City Council",
+            "applications_found": len(features),
+            "applications": [
+                feature.get("attributes", {})
+                for feature in features
+            ],
+        }
+
+    except Exception as exc:
+        logger.exception("Leeds data test failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Leeds data test failed: {str(exc)}"
+        )
