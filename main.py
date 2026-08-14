@@ -7,7 +7,7 @@ app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
-# ENVIRONMENT VARIABLES
+# ENV VARS
 OKEY = os.getenv("OPENAI_API_KEY")
 SURL = os.getenv("SUPABASE_DB_URL")
 S_SEC = os.getenv("STRIPE_SECRET_KEY")
@@ -18,60 +18,68 @@ T_SEC = os.getenv("TRIGGER_SECRET")
 P_URL = os.getenv("PUBLIC_APP_URL")
 
 R_URL = "https://api.resend.com/emails"
-# Going back to Layer 12 - the only one that we know sends data reliably
+# We are using the main layer that worked at the very start
 L_URL = "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query"
 
 client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# Broadened keywords to catch more tree work
-TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "stump", "birch", "oak", "ash", "sycamore", "conservation"]
-BAD_WORDS = ["dwelling", "new build", "erection of", "conversion"]
+TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "stump", "arboriculture", "conservation"]
+SKIP_WORDS = ["dwelling", "extension", "new build", "erection of"]
 
 def get_date(r):
-    # Try every possible date field Leeds uses
-    val = r.get("DATEAPVAL") or r.get("DATE_RECEIVED") or r.get("DATE_VALID") or 0
-    return float(val)
+    # Leeds date fields
+    v = r.get("DATEAPVAL") or r.get("DATE_RECEIVED") or 0
+    return float(v)
 
 def classify(r):
-    prop = str(r.get("PROPOSAL") or "").lower()
-    if not prop: return False, 0
-    matches = [k for k in TREE_WORDS if k in prop]
+    p = str(r.get("PROPOSAL") or "").lower()
+    if not p: return False, 0
+    matches = [k for k in TREE_WORDS if k in p]
     score = len(matches)
-    if "tree" in prop: score += 2
-    if any(x in prop for x in ["fell", "remove", "crown"]): score += 5
-    # If it's a house extension that happens to mention a tree, skip it unless it's a big tree job
-    if any(b in prop for b in BAD_WORDS) and score < 7: return False, 0
-    return (score > 2), score
+    if "tree" in p: score += 2
+    if any(x in p for x in ["fell", "remove", "crown"]): score += 5
+    if any(w in p for w in SKIP_WORDS) and score < 7: return False, 0
+    return (score > 1), score
 
-def fetch_data():
-    # Fetch 300 records. No sorting/filtering on server side to avoid 400 errors.
+def fetch_leeds_raw():
+    # This is the EXACT request structure that worked at the start
     params = {
         "where": "1=1",
-        "outFields": "REFVAL,ADDRESS,PROPOSAL,DATEAPVAL,DATE_RECEIVED,OBJECTID",
-        "resultRecordCount": 300,
+        "outFields": "*",
+        "returnGeometry": "false",
+        "resultRecordCount": 1000,
         "f": "json"
     }
+    # This header makes the server think we are a standard Chrome browser
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Referer": "https://www.leeds.gov.uk/"
+    }
     try:
-        res = requests.get(L_URL, params=params, timeout=20)
+        res = requests.get(L_URL, params=params, headers=headers, timeout=30)
         data = res.json()
-        recs = [f.get("attributes", {}) for f in data.get("features", [])]
-        # Sort by Date then by ObjectID (Higher ID usually means newer)
-        recs.sort(key=lambda x: (get_date(x), x.get("OBJECTID", 0)), reverse=True)
-        return recs
+        if "features" in data:
+            recs = [f.get("attributes", {}) for f in data["features"]]
+            # Sort them NEWEST to OLDEST here in our code
+            recs.sort(key=lambda x: get_date(x), reverse=True)
+            return recs
+        else:
+            logger.error(f"Council returned no features: {data}")
+            return []
     except Exception as e:
-        logger.error(f"Fetch failed: {e}")
+        logger.error(f"Council connection failed: {e}")
         return []
 
 @app.get("/")
-def home(): return {"status": "V2.2 - Data Flow Recovery"}
+def home(): return {"status": "V2.4 Human-Mask Active"}
 
 @app.get("/test-leeds")
 def test():
-    recs = fetch_data()
-    # Looking for items from the last 120 days
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=120)).timestamp() * 1000
+    recs = fetch_leeds_raw()
+    # Find leads from the last 90 days
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=90)).timestamp() * 1000
     leads = []
     for r in recs:
         is_tree, score = classify(r)
@@ -81,28 +89,28 @@ def test():
             r["_date"] = datetime.fromtimestamp(d/1000, tz=timezone.utc).strftime("%Y-%m-%d")
             leads.append(r)
     return {
-        "total_scanned_from_council": len(recs),
-        "tree_leads_found": len(leads),
-        "leads": leads
+        "scanned_from_council": len(recs),
+        "leads_found_in_90_days": len(leads),
+        "leads": leads[:20]
     }
 
 @app.get("/trigger-scrape")
 def scrape(x_trigger_secret: str = Header(default=None)):
     if x_trigger_secret != T_SEC: raise HTTPException(status_code=401)
-    recs = fetch_data()
-    # Trigger only looks at the last 30 days
+    recs = fetch_leeds_raw()
     cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).timestamp() * 1000
     found = []
     for r in recs:
-        is_tree, score = classify(r)
-        if is_tree and get_date(r) >= cutoff:
-            r["_score"] = score
-            found.append(r)
-    if not found: return {"status": "no new leads"}
+        if get_date(r) >= cutoff:
+            is_tree, score = classify(r)
+            if is_tree:
+                r["_score"] = score
+                found.append(r)
+    if not found: return {"status": "no leads"}
     found.sort(key=lambda x: x["_score"], reverse=True)
     best = found[0]
     
-    # AI Process
+    # AI Extraction
     ai_msg = f"Ref: {best.get('REFVAL')} Addr: {best.get('ADDRESS')} Prop: {best.get('PROPOSAL')}"
     ai_res = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -137,7 +145,6 @@ def scrape(x_trigger_secret: str = Header(default=None)):
             metadata={"surgeon_id": str(cn["id"]), "postcode": ld.get("postcode", ""), "site_address": ld.get("site_address", ""), "ref": best.get("REFVAL", "")}
         )
         requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [cn["email"]], "subject": "New Lead", "text": f"New Job: {ld['scope_summary']}. Link: {sess.url}"}, headers={"Authorization": f"Bearer {R_KEY}", "Content-Type": "application/json"})
-
     return {"status": "sent", "address": ld["site_address"]}
 
 @app.post("/webhook")
@@ -148,15 +155,3 @@ async def webhook(req: Request):
         event = stripe.Webhook.construct_event(payload, sig, S_WH)
         if event["type"] == "checkout.session.completed":
             sess = event["data"]["object"]
-            if sess["id"] not in _processed:
-                _processed.add(sess["id"])
-                m = sess["metadata"]
-                requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [T_EM], "subject": "Lead Paid!", "text": f"PAID: {m.get('ref')} - {m.get('site_address')}"}, headers={"Authorization": f"Bearer {R_KEY}", "Content-Type": "application/json"})
-    except: pass
-    return {"status": "ok"}
-
-@app.get("/payment-success")
-def success(): return {"message": "Success"}
-
-@app.get("/payment-cancelled")
-def cancel(): return {"message": "Cancelled"}
