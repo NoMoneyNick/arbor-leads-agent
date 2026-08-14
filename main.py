@@ -1,9 +1,10 @@
-import os, json, logging, requests, psycopg2, stripe
+import os, json, logging, requests, psycopg2, stripe, math
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, HTTPException, Query
+from fastapi.responses import HTML_Response
 from openai import OpenAI
 
-app = FastAPI(title="Vector Data Labs - Surrey Engine", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
@@ -13,67 +14,58 @@ S_SEC, S_WH = os.getenv("STRIPE_SECRET_KEY"), os.getenv("STRIPE_WEBHOOK_SECRET")
 R_KEY, T_EM = os.getenv("RESEND_API_KEY"), os.getenv("TEST_EMAIL")
 T_SEC, P_URL = os.getenv("TRIGGER_SECRET"), os.getenv("PUBLIC_APP_URL")
 
-R_URL = "https://api.resend.com/emails"
+R_URL, L_URL = "https://api.resend.com/emails", "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query"
+
 client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# --- THE TUNED COUNCIL LIST ---
-COUNCILS = {
-    "Leeds": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query",
-    "Woking": "https://maps.woking.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
-    "Waverley": "https://planningit.waverley.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
-    "Elmbridge": "https://maps.elmbridge.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
-    "Guildford": "https://www2.guildford.gov.uk/arcgis/rest/services/Planning/PlanningApplications/MapServer/0/query",
-    "Surrey Heath": "https://maps.surreyheath.gov.uk/arcgis/rest/services/Planning/PlanningApplications/MapServer/0/query"
-}
+# --- WEB PAGES FOR STRIPE ---
 
-TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "stump", "arboriculture", "conservation", "birch", "oak", "ash", "sycamore", "willow"]
+@app.get("/", response_class=HTML_Response, include_in_schema=False)
+def lander():
+    return """
+    <html><head><title>Vector Data Labs</title><style>body{font-family:sans-serif;line-height:1.6;max-width:800px;margin:auto;padding:50px;color:#333;} h1{color:#2e7d32;} .btn{background:#2e7d32;color:white;padding:10px 20px;text-decoration:none;border-radius:5px;}</style></head>
+    <body><h1>Vector Data Labs</h1><p>High-quality, real-time lead generation for UK arboricultural contractors.</p>
+    <p>We monitor council planning portals to identify Tree Preservation Order (TPO) and Conservation Area applications, delivering exclusive leads directly to your inbox.</p>
+    <p><strong>Contact:</strong> """ + str(T_EM) + """</p>
+    <hr/><p style='font-size:12px;'><a href='/terms'>Terms of Service</a> | <a href='/privacy'>Privacy Policy</a></p></body></html>
+    """
+
+@app.get("/terms", response_class=HTML_Response, include_in_schema=False)
+def terms():
+    return "<html><body><h1>Terms of Service</h1><p>Vector Data Labs provides information services. All sales are final. We do not guarantee the accuracy of council data.</p></body></html>"
+
+@app.get("/privacy", response_class=HTML_Response, include_in_schema=False)
+def privacy():
+    return "<html><body><h1>Privacy Policy</h1><p>We only collect data necessary to process your lead purchases and provide alerts.</p></body></html>"
+
+# --- THE LOGIC ---
+
+TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "stump", "arboriculture", "conservation"]
 SKIP_WORDS = ["dwelling", "erection of", "new build", "conversion"]
 
 def get_d(r):
-    v = r.get("DATEAPVAL") or r.get("DATE_RECEIVED") or r.get("DATE_VALID") or r.get("VALIDATED") or 0
+    v = r.get("DATEAPVAL") or r.get("DATE_RECEIVED") or 0
     return float(v)
 
 def classify(r):
-    p = str(r.get("PROPOSAL") or r.get("DESCRIPTION") or r.get("DESCRIPT") or "").lower()
+    p = str(r.get("PROPOSAL") or "").lower()
     if not p: return False, 0
     m = [k for k in TREE_WORDS if k in p]
     s = len(m)
     if "tree" in p: s += 2
-    if any(x in p for x in ["fell", "remove", "crown", "reduce", "thin"]): s += 5
+    if any(x in p for x in ["fell", "remove", "crown"]): s += 5
     if any(w in p for w in SKIP_WORDS) and s < 7: return False, 0
     return (s > 1), s
 
-def fetch_council(name, url):
-    h = {"User-Agent": "Mozilla/5.0 Chrome/121.0.0.0", "Referer": url}
-    # Surrey councils need smaller requests. We ask for 50 records and NO server sorting.
-    limit = 1000 if name == "Leeds" else 100
-    q = {
-        "where": "1=1",
-        "outFields": "*",
-        "returnGeometry": "false",
-        "resultRecordCount": limit,
-        "f": "json"
-    }
-    # Only Leeds gets the complex sorting command
-    if name == "Leeds":
-        q["orderByFields"] = "OBJECTID DESC"
-        
+def fetch_leeds():
+    h = {"User-Agent": "Mozilla/5.0"}
+    q = {"where": "1=1", "outFields": "*", "resultRecordCount": 500, "orderByFields": "OBJECTID DESC", "f": "json"}
     try:
-        res = requests.get(url, params=q, headers=h, timeout=20)
-        data = res.json()
-        if "error" in data:
-            return [], f"Error: {data['error'].get('message')}"
-        
-        recs = [f.get("attributes", {}) for f in data.get("features", [])]
-        # We sort them here in Python to avoid crashing their servers
-        recs.sort(key=lambda x: (get_d(x), x.get("OBJECTID", 0)), reverse=True)
-        return recs, "Success"
-    except Exception as e:
-        return [], str(e)
-
-# --- DATABASE ---
+        res = requests.get(L_URL, params=q, headers=h, timeout=30)
+        return [f.get("attributes", {}) for f in res.json().get("features", [])]
+    except: return []
 
 def is_already_sent(ref):
     if not SURL: return False
@@ -91,86 +83,61 @@ def is_already_sent(ref):
 def mark_as_sent(ref):
     if not SURL: return
     try:
-        conn = psycopg2.connect(SURL)
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO sent_leads (ref) VALUES (%s) ON CONFLICT DO NOTHING", (ref,))
+        conn = psycopg2.connect(SURL); cur = conn.cursor()
+        cur.execute("INSERT INTO sent_leads (ref) VALUES (%s) ON CONFLICT DO NOTHING", (ref,))
         conn.commit(); conn.close()
     except: pass
 
-# --- EMAILS ---
-
-def send_email(to, subject, html):
-    payload = {"from": "Vector Data Labs <onboarding@resend.dev>", "to": [to], "subject": subject, "html": html}
-    requests.post(R_URL, json=payload, headers={"Authorization": f"Bearer {R_KEY}", "Content-Type": "application/json"})
-
-def get_html(cn_name, ld, url, c_name):
-    clean = ld['scope_summary'].replace('\r', '<br/>').replace('\n', '<br/>')
-    return f"""<div style="font-family:Arial;max-width:600px;margin:auto;border:1px solid #ddd;border-radius:10px;overflow:hidden;">
-    <div style="background:#2e7d32;padding:20px;text-align:center;color:white;"><h2 style="margin:0;">New Tree Lead: {c_name}</h2></div>
-    <div style="padding:30px;"><p>Hello {cn_name}, a new job is available in the {c_name} area:</p>
-    <div style="background:#f9f9f9;padding:15px;border-radius:5px;border:1px solid #eee;">
-    <p><strong>Work:</strong><br/>{clean}</p><p><strong>Postcode:</strong> {ld['postcode']}</p></div>
-    <div style="text-align:center;margin:30px 0;"><a href="{url}" style="background:#2e7d32;color:white;padding:15px 30px;text-decoration:none;border-radius:5px;font-weight:bold;font-size:18px;">Secure Lead</a></div>
-    </div></div>"""
-
 # --- ROUTES ---
 
-@app.get("/test-regional", tags=["Diagnostics"])
-def test_all():
-    results = {}
-    for name, url in COUNCILS.items():
-        recs, status = fetch_council(name, url)
-        found = [r for r in recs if classify(r)[0]]
-        results[name] = {"status": status, "scanned": len(recs), "leads": len(found)}
-    return results
-
 @app.get("/trigger-scrape", tags=["Live"])
-def scrape(secret: str = Query(..., description="TRIGGER_SECRET")):
+def scrape(secret: str = Query(...)):
     if secret != T_SEC: raise HTTPException(status_code=401)
-    leads_sent = 0
-    for c_name, c_url in COUNCILS.items():
-        recs, status = fetch_council(c_name, c_url)
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=21)).timestamp() * 1000
-        for r in recs:
-            ref = r.get("REFVAL") or r.get("REFERENCE") or r.get("PLANNO") or str(r.get("OBJECTID"))
-            is_t, s = classify(r)
-            if is_t and (get_d(r) >= cutoff or get_d(r) == 0) and not is_already_sent(ref):
-                # AI
-                prop = r.get('PROPOSAL') or r.get('DESCRIPTION') or r.get('DESCRIPT')
-                addr = r.get('ADDRESS') or r.get('LOCATION') or r.get('SITE_ADDRESS')
-                ai = client.chat.completions.create(
-                    model="gpt-4o-mini", response_format={"type": "json_object"},
-                    messages=[{"role": "system", "content": "Return JSON: applicant_name, site_address, postcode, scope_summary, high_value (bool)"},
-                              {"role": "user", "content": f"Addr: {addr} Prop: {prop}"}]
-                )
-                ld = json.loads(ai.choices[0].message.content)
-                
-                # Contractors
-                cons = []
-                if SURL:
-                    try:
-                        db = psycopg2.connect(SURL); c = db.cursor()
-                        c.execute("SELECT id, business_name, email FROM tree_surgeons WHERE active IS TRUE")
-                        for row in c.fetchall(): cons.append({"id": row[0], "name": row[1], "email": row[2]})
-                        db.close()
-                    except: pass
-                if not cons: cons.append({"id": 1, "name": "Test User", "email": T_EM})
-                
-                for cn in cons:
-                    amt = 4500 if ld.get("high_value") else 2500
-                    sess = stripe.checkout.Session.create(
-                        payment_method_types=["card"],
-                        line_items=[{"price_data": {"currency": "gbp", "product_data": {"name": f"Exclusive Lead: {c_name}"}, "unit_amount": amt}, "quantity": 1}],
-                        mode="payment", success_url=f"{P_URL}/payment-success", cancel_url=f"{P_URL}/payment-cancelled",
-                        metadata={"surgeon_id": str(cn["id"]), "ref": ref, "site_address": ld.get("site_address"), "applicant_name": ld.get("applicant_name")}
-                    )
-                    send_email(cn["email"], f"New Tree Lead: {c_name} Area", get_html(cn["name"], ld, sess.url, c_name))
-                
-                mark_as_sent(ref)
-                leads_sent += 1
-                if leads_sent >= 3: break
-        if leads_sent >= 3: break
-    return {"status": "success", "leads_sent": leads_sent}
+    recs = fetch_leeds()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).timestamp() * 1000
+    found = [r for r in recs if get_d(r) >= cutoff and classify(r)[0]]
+    if not found: return {"status": "no leads"}
+    found.sort(key=lambda x: classify(x)[1], reverse=True)
+    
+    selected = None
+    for r in found:
+        if not is_already_sent(r.get("REFVAL")):
+            selected = r
+            break
+    
+    if not selected: return {"status": "all sent"}
+    
+    ai = client.chat.completions.create(
+        model="gpt-4o-mini", response_format={"type": "json_object"},
+        messages=[{"role": "system", "content": "Return JSON: applicant_name, site_address, postcode, scope_summary, high_value (bool)"},
+                  {"role": "user", "content": f"Addr: {selected.get('ADDRESS')} Prop: {selected.get('PROPOSAL')}"}]
+    )
+    ld = json.loads(ai.choices[0].message.content)
+    
+    # Contractors
+    cons = []
+    if SURL:
+        try:
+            db = psycopg2.connect(SURL); c = db.cursor()
+            c.execute("SELECT id, email FROM tree_surgeons WHERE active IS TRUE")
+            for row in c.fetchall(): cons.append({"id": row[0], "email": row[1]})
+            db.close()
+        except: pass
+    if not cons: cons.append({"id": 1, "email": T_EM})
+    
+    for cn in cons:
+        amt = 4500 if ld.get("high_value") else 2500
+        sess = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            line_items=[{"price_data": {"currency": "gbp", "product_data": {"name": "Exclusive Tree Lead"}, "unit_amount": amt}, "quantity": 1}],
+            mode="payment", success_url=f"{P_URL}/payment-success", cancel_url=f"{P_URL}/payment-cancelled",
+            metadata={"surgeon_id": str(cn["id"]), "ref": selected.get("REFVAL"), "site_address": ld.get("site_address"), "applicant_name": ld.get("applicant_name")}
+        )
+        payload = {"from": "Vector Data Labs <onboarding@resend.dev>", "to": [cn["email"]], "subject": "New Lead Found", "html": f"<h3>New Job</h3><p>{ld['scope_summary']}</p><a href='{sess.url}'>Buy Lead</a>"}
+        requests.post(R_URL, json=payload, headers={"Authorization": f"Bearer {R_KEY}"})
+    
+    mark_as_sent(selected.get("REFVAL"))
+    return {"status": "sent", "address": ld["site_address"]}
 
 @app.post("/webhook", include_in_schema=False)
 async def webhook(req: Request):
@@ -182,13 +149,13 @@ async def webhook(req: Request):
             if sess["id"] not in _processed:
                 _processed.add(sess["id"])
                 m = sess["metadata"]
-                html = f"<h2>Lead Unlocked</h2><p>Address: {m.get('site_address')}</p><p>Applicant: {m.get('applicant_name')}</p>"
-                send_email(T_EM, "Lead Paid Successfully", html)
+                msg = f"PAID: {m.get('site_address')}"
+                requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [T_EM], "subject": "Lead Paid!", "text": msg}, headers={"Authorization": f"Bearer {R_KEY}"})
     except: pass
     return {"status": "ok"}
 
 @app.get("/payment-success", include_in_schema=False)
-def success(): return {"message": "Payment Successful"}
+def success(): return {"message": "Success"}
 
 @app.get("/payment-cancelled", include_in_schema=False)
 def cancel(): return {"message": "Payment Cancelled"}
