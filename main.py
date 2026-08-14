@@ -4,10 +4,10 @@ from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from openai import OpenAI
 
-# Disable SSL warnings for councils with internal certificates (common in London)
+# Silence SSL warnings for councils with internal/self-signed certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="Vector Data Labs - V9.3 London Tactical", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs - V9.4 London Reconstruction", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
@@ -22,49 +22,38 @@ client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# --- THE LONDON TACTICAL LIST (V9.3 Verified Direct Links) ---
+# --- THE LONDON RECONSTRUCTION LIST (V9.4 Verified Production Paths) ---
 COUNCILS = {
     "Leeds_Control": {
         "url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query",
         "referer": "https://www.leeds.gov.uk/"
     },
     "London_Mega_Hub": {
-        "url": "https://gis2.london.gov.uk/server/rest/services/apps/planning_data_map_02/MapServer/0/query",
+        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_London_Datahub/FeatureServer/0/query",
         "referer": "https://www.london.gov.uk/"
     },
-    "Southwark_London": {
-        "url": "https://geo.southwark.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
-        "referer": "https://www.southwark.gov.uk/"
-    },
-    "Croydon_London": {
-        "url": "https://maps.croydon.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
-        "referer": "https://www.croydon.gov.uk/"
-    },
-    "Wandsworth_Richmond": {
+    "Richmond_Wandsworth": {
         "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications/FeatureServer/0/query",
         "referer": "https://www.wandsworth.gov.uk/"
+    },
+    "Southwark_London": {
+        "url": "https://geo.southwark.gov.uk/arcgis/rest/services/Planning/Planning_Applications/FeatureServer/0/query",
+        "referer": "https://www.southwark.gov.uk/"
+    },
+    "Hackney_London": {
+        "url": "https://map.hackney.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
+        "referer": "https://www.hackney.gov.uk/"
     }
 }
 
 # --- WEB PAGES ---
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def lander():
-    return f"""
-    <html>
-        <body style='font-family:sans-serif; text-align:center; padding-top:50px; background:#fafafa;'>
-            <div style='display:inline-block; padding:40px; background:white; border-radius:10px; border-top:5px solid #2e7d32; box-shadow:0 4px 6px rgba(0,0,0,0.1);'>
-                <h1>Vector Data Labs V9.3</h1>
-                <p>System Online. Leeds Active. London Discovery in progress.</p>
-                <hr style='border:0; border-top:1px solid #eee; margin:20px 0;'/>
-                <a href='/test-regional' style='color:#2e7d32; text-decoration:none; font-weight:bold;'>Run Regional Health Check</a>
-            </div>
-        </body>
-    </html>
-    """
+    return f"<html><body style='font-family:sans-serif;text-align:center;'><h1>Vector Data Labs V9.4</h1><p>Leeds: ACTIVE | London: RECONSTRUCTION</p><a href='/test-regional'>Run Health Check</a></body></html>"
 
-# --- LOGIC: CLASSIFICATION ---
+# --- CLASSIFICATION LOGIC (DNA PRESERVED) ---
 TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "stump", "arboriculture", "oak", "ash ", "cedar", "conifer", "birch", "maple", "willow", "sycamore"]
-SKIP_WORDS = ["dwelling", "erection of", "new build", "extension", "loft conversion", "basement", "demolition"]
+SKIP_WORDS = ["dwelling", "erection of", "new build", "extension", "loft conversion"]
 
 def get_d(r):
     v = r.get("DATE_RECEIVED") or r.get("DATE_VALID") or r.get("DATEAPVAL") or r.get("RECDAT") or 0
@@ -72,7 +61,7 @@ def get_d(r):
     except: return 0
 
 def classify(r):
-    # Searches all possible description keys used across different London schemas
+    # Search all possible description fields
     p = str(
         r.get("development_description") or 
         r.get("PROPOSAL") or 
@@ -89,12 +78,12 @@ def classify(r):
     if "tree" in p: score += 2
     if any(x in p for x in ["fell", "remove", "crown", "tpo", "conservation area"]): score += 5
     
-    # Strict London filtering: Avoid extensions and new builds unless they are massive tree jobs
+    # Negative filtering for London
     if any(w in p for w in SKIP_WORDS) and score < 8: return False, 0
     
     return (score > 2), score
 
-# --- LOGIC: FETCHING ---
+# --- FETCHING LOGIC (ENHANCED) ---
 def fetch_council(name, config):
     url = config["url"]
     h = {
@@ -103,7 +92,7 @@ def fetch_council(name, config):
         "Accept": "application/json"
     }
     
-    # Using a 100 record count for a wider net
+    # Standard query for recent records
     q = {
         "where": "1=1", 
         "outFields": "*", 
@@ -113,7 +102,7 @@ def fetch_council(name, config):
     }
     
     try:
-        # verify=False is critical for London borough servers (Southwark/Croydon)
+        # BATTLE SECRET: verify=False is required for internal London certificates
         res = requests.get(url, params=q, headers=h, timeout=20, verify=False)
         
         if res.status_code != 200:
@@ -129,7 +118,7 @@ def fetch_council(name, config):
     except Exception as e:
         return [], f"Connection Fail: {str(e)}"
 
-# --- DATABASE ---
+# --- DATABASE (DNA PRESERVED) ---
 def is_already_sent(ref):
     if not SURL: return False
     try:
@@ -152,7 +141,7 @@ def mark_as_sent(ref):
 
 @app.get("/test-regional")
 def test_all():
-    """Scoreboard for London Expansion."""
+    """Diagnostic scoreboard."""
     results = {}
     for name, config in COUNCILS.items():
         recs, status = fetch_council(name, config)
@@ -193,7 +182,7 @@ def scrape(secret: str = Query(...)):
                     ld = json.loads(ai.choices[0].message.content)
                 except: continue
 
-                # Get Surgeons from Supabase
+                # Get Surgeons
                 surgeons = []
                 if SURL:
                     try:
@@ -206,11 +195,10 @@ def scrape(secret: str = Query(...)):
                 if not surgeons: surgeons.append({"id": 1, "email": T_EM})
 
                 for sgn in surgeons:
-                    # London leads are higher value: £35 / £60
                     amt = 6000 if ld.get("high_value") else 3500
                     checkout = stripe.checkout.Session.create(
                         payment_method_types=["card"],
-                        line_items=[{"price_data": {"currency": "gbp", "product_data": {"name": f"London Tree Lead: {ld.get('site_address')}"}, "unit_amount": amt}, "quantity": 1}],
+                        line_items=[{"price_data": {"currency": "gbp", "product_data": {"name": f"London Lead: {ld.get('site_address')}"}, "unit_amount": amt}, "quantity": 1}],
                         mode="payment", success_url=f"{P_URL}/payment-success", cancel_url=f"{P_URL}/payment-cancelled",
                         metadata={"surgeon_id": str(sgn["id"]), "ref": ref, "site_address": ld.get("site_address")}
                     )
@@ -221,7 +209,7 @@ def scrape(secret: str = Query(...)):
                         <p><strong>Work:</strong> {ld.get('scope_summary')}</p>
                         <p><strong>Location:</strong> {ld.get('site_address')}</p>
                         <br/>
-                        <a href='{checkout.url}' style='background:#2e7d32; color:white; padding:15px 30px; text-decoration:none; border-radius:5px; font-weight:bold; display:inline-block;'>Buy Lead Details (£{amt/100})</a>
+                        <a href='{checkout.url}' style='background:#2e7d32; color:white; padding:12px 25px; text-decoration:none; border-radius:5px; font-weight:bold; display:inline-block;'>Buy Lead Details (£{amt/100})</a>
                     </div>
                     """
                     requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [sgn["email"]], "subject": f"Lead: {ld.get('site_address')}", "html": email_html}, headers={"Authorization": f"Bearer {R_KEY}"})
@@ -248,7 +236,7 @@ async def webhook(req: Request):
     return {"status": "ok"}
 
 @app.get("/payment-success", include_in_schema=False)
-def success(): return HTMLResponse("<h1>Success!</h1><p>Check your email for the lead details.</p>")
+def success(): return HTMLResponse("<h1>Success!</h1>")
 
 @app.get("/payment-cancelled", include_in_schema=False)
 def cancel(): return HTMLResponse("<h1>Cancelled</h1>")
