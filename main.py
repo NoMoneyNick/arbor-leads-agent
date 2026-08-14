@@ -18,12 +18,12 @@ client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# --- THE SURREY & LEEDS LIST ---
+# --- THE TUNED COUNCIL LIST ---
 COUNCILS = {
     "Leeds": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query",
     "Woking": "https://maps.woking.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
     "Waverley": "https://planningit.waverley.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
-    "Elmbridge": "https://maps.elmbridge.gov.uk/arcgis/rest/services/Planning_Applications/MapServer/0/query",
+    "Elmbridge": "https://maps.elmbridge.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
     "Guildford": "https://www2.guildford.gov.uk/arcgis/rest/services/Planning/PlanningApplications/MapServer/0/query",
     "Surrey Heath": "https://maps.surreyheath.gov.uk/arcgis/rest/services/Planning/PlanningApplications/MapServer/0/query"
 }
@@ -45,13 +45,33 @@ def classify(r):
     if any(w in p for w in SKIP_WORDS) and s < 7: return False, 0
     return (s > 1), s
 
-def fetch_council(url):
-    h = {"User-Agent": "Mozilla/5.0 Chrome/121.0.0.0"}
-    q = {"where": "1=1", "outFields": "*", "returnGeometry": "false", "resultRecordCount": 150, "orderByFields": "OBJECTID DESC", "f": "json"}
+def fetch_council(name, url):
+    h = {"User-Agent": "Mozilla/5.0 Chrome/121.0.0.0", "Referer": url}
+    # Surrey councils need smaller requests. We ask for 50 records and NO server sorting.
+    limit = 1000 if name == "Leeds" else 100
+    q = {
+        "where": "1=1",
+        "outFields": "*",
+        "returnGeometry": "false",
+        "resultRecordCount": limit,
+        "f": "json"
+    }
+    # Only Leeds gets the complex sorting command
+    if name == "Leeds":
+        q["orderByFields"] = "OBJECTID DESC"
+        
     try:
-        res = requests.get(url, params=q, headers=h, timeout=15)
-        return [f.get("attributes", {}) for f in res.json().get("features", [])]
-    except: return []
+        res = requests.get(url, params=q, headers=h, timeout=20)
+        data = res.json()
+        if "error" in data:
+            return [], f"Error: {data['error'].get('message')}"
+        
+        recs = [f.get("attributes", {}) for f in data.get("features", [])]
+        # We sort them here in Python to avoid crashing their servers
+        recs.sort(key=lambda x: (get_d(x), x.get("OBJECTID", 0)), reverse=True)
+        return recs, "Success"
+    except Exception as e:
+        return [], str(e)
 
 # --- DATABASE ---
 
@@ -97,12 +117,11 @@ def get_html(cn_name, ld, url, c_name):
 
 @app.get("/test-regional", tags=["Diagnostics"])
 def test_all():
-    """Scoreboard to see how many leads are in each council area."""
     results = {}
     for name, url in COUNCILS.items():
-        recs = fetch_council(url)
+        recs, status = fetch_council(name, url)
         found = [r for r in recs if classify(r)[0]]
-        results[name] = {"scanned": len(recs), "leads": len(found)}
+        results[name] = {"status": status, "scanned": len(recs), "leads": len(found)}
     return results
 
 @app.get("/trigger-scrape", tags=["Live"])
@@ -110,12 +129,12 @@ def scrape(secret: str = Query(..., description="TRIGGER_SECRET")):
     if secret != T_SEC: raise HTTPException(status_code=401)
     leads_sent = 0
     for c_name, c_url in COUNCILS.items():
-        recs = fetch_council(c_url)
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=14)).timestamp() * 1000
+        recs, status = fetch_council(c_name, c_url)
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=21)).timestamp() * 1000
         for r in recs:
             ref = r.get("REFVAL") or r.get("REFERENCE") or r.get("PLANNO") or str(r.get("OBJECTID"))
             is_t, s = classify(r)
-            if is_t and get_d(r) >= cutoff and not is_already_sent(ref):
+            if is_t and (get_d(r) >= cutoff or get_d(r) == 0) and not is_already_sent(ref):
                 # AI
                 prop = r.get('PROPOSAL') or r.get('DESCRIPTION') or r.get('DESCRIPT')
                 addr = r.get('ADDRESS') or r.get('LOCATION') or r.get('SITE_ADDRESS')
@@ -125,6 +144,7 @@ def scrape(secret: str = Query(..., description="TRIGGER_SECRET")):
                               {"role": "user", "content": f"Addr: {addr} Prop: {prop}"}]
                 )
                 ld = json.loads(ai.choices[0].message.content)
+                
                 # Contractors
                 cons = []
                 if SURL:
@@ -135,6 +155,7 @@ def scrape(secret: str = Query(..., description="TRIGGER_SECRET")):
                         db.close()
                     except: pass
                 if not cons: cons.append({"id": 1, "name": "Test User", "email": T_EM})
+                
                 for cn in cons:
                     amt = 4500 if ld.get("high_value") else 2500
                     sess = stripe.checkout.Session.create(
@@ -144,6 +165,7 @@ def scrape(secret: str = Query(..., description="TRIGGER_SECRET")):
                         metadata={"surgeon_id": str(cn["id"]), "ref": ref, "site_address": ld.get("site_address"), "applicant_name": ld.get("applicant_name")}
                     )
                     send_email(cn["email"], f"New Tree Lead: {c_name} Area", get_html(cn["name"], ld, sess.url, c_name))
+                
                 mark_as_sent(ref)
                 leads_sent += 1
                 if leads_sent >= 3: break
