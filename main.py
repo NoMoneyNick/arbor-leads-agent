@@ -7,7 +7,7 @@ app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
-# ENV VARS
+# ENVIRONMENT VARIABLES
 OKEY = os.getenv("OPENAI_API_KEY")
 SURL = os.getenv("SUPABASE_DB_URL")
 S_SEC = os.getenv("STRIPE_SECRET_KEY")
@@ -18,90 +18,103 @@ T_SEC = os.getenv("TRIGGER_SECRET")
 P_URL = os.getenv("PUBLIC_APP_URL")
 
 R_URL = "https://api.resend.com/emails"
-# Layer 1 is "Applications in the last 28 days" - much faster!
-L_URL = "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/1/query"
+# Going back to Layer 12 - the only one that we know sends data reliably
+L_URL = "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query"
 
 client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "stump", "arboriculture", "sycamore", "oak", "ash", "conservation area"]
-SKIP_WORDS = ["dwelling", "extension", "new build", "erection of", "conversion"]
+# Broadened keywords to catch more tree work
+TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "stump", "birch", "oak", "ash", "sycamore", "conservation"]
+BAD_WORDS = ["dwelling", "new build", "erection of", "conversion"]
+
+def get_date(r):
+    # Try every possible date field Leeds uses
+    val = r.get("DATEAPVAL") or r.get("DATE_RECEIVED") or r.get("DATE_VALID") or 0
+    return float(val)
 
 def classify(r):
-    # Leeds uses 'PROPOSAL' or 'DESCRIPT'
-    p = str(r.get("PROPOSAL") or r.get("DESCRIPT") or "").lower()
-    if not p: return False, 0
-    matches = [k for k in TREE_WORDS if k in p]
+    prop = str(r.get("PROPOSAL") or "").lower()
+    if not prop: return False, 0
+    matches = [k for k in TREE_WORDS if k in prop]
     score = len(matches)
-    if "tree" in p and "conservation area" in p: score += 10
-    if any(x in p for x in ["fell", "remove", "crown", "tpo"]): score += 5
-    is_bad = any(w in p for w in SKIP_WORDS)
-    if matches and not is_bad: return True, score
-    if score > 8: return True, score
-    return False, 0
+    if "tree" in prop: score += 2
+    if any(x in prop for x in ["fell", "remove", "crown"]): score += 5
+    # If it's a house extension that happens to mention a tree, skip it unless it's a big tree job
+    if any(b in prop for b in BAD_WORDS) and score < 7: return False, 0
+    return (score > 2), score
 
-def fetch_leeds():
+def fetch_data():
+    # Fetch 300 records. No sorting/filtering on server side to avoid 400 errors.
     params = {
         "where": "1=1",
-        "outFields": "*",
-        "returnGeometry": "false",
-        "resultRecordCount": 100,
+        "outFields": "REFVAL,ADDRESS,PROPOSAL,DATEAPVAL,DATE_RECEIVED,OBJECTID",
+        "resultRecordCount": 300,
         "f": "json"
     }
     try:
         res = requests.get(L_URL, params=params, timeout=20)
         data = res.json()
-        return [f.get("attributes", {}) for f in data.get("features", [])]
+        recs = [f.get("attributes", {}) for f in data.get("features", [])]
+        # Sort by Date then by ObjectID (Higher ID usually means newer)
+        recs.sort(key=lambda x: (get_date(x), x.get("OBJECTID", 0)), reverse=True)
+        return recs
     except Exception as e:
-        logger.error(f"Fetch error: {e}")
+        logger.error(f"Fetch failed: {e}")
         return []
 
 @app.get("/")
-def home(): return {"status": "V2.1 Last-28-Days Active"}
+def home(): return {"status": "V2.2 - Data Flow Recovery"}
 
 @app.get("/test-leeds")
 def test():
-    recs = fetch_leeds()
+    recs = fetch_data()
+    # Looking for items from the last 120 days
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=120)).timestamp() * 1000
     leads = []
     for r in recs:
         is_tree, score = classify(r)
-        if is_tree:
+        d = get_date(r)
+        if is_tree and d >= cutoff:
             r["_score"] = score
-            # Try to find a date
-            d_val = r.get("DATEAPVAL") or r.get("DATE_RECEIVED") or 0
-            if d_val:
-                r["_date"] = datetime.fromtimestamp(float(d_val)/1000, tz=timezone.utc).strftime("%Y-%m-%d")
+            r["_date"] = datetime.fromtimestamp(d/1000, tz=timezone.utc).strftime("%Y-%m-%d")
             leads.append(r)
-    return {"scanned": len(recs), "found": len(leads), "leads": leads}
+    return {
+        "total_scanned_from_council": len(recs),
+        "tree_leads_found": len(leads),
+        "leads": leads
+    }
 
 @app.get("/trigger-scrape")
 def scrape(x_trigger_secret: str = Header(default=None)):
     if x_trigger_secret != T_SEC: raise HTTPException(status_code=401)
-    recs = fetch_leeds()
+    recs = fetch_data()
+    # Trigger only looks at the last 30 days
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).timestamp() * 1000
     found = []
     for r in recs:
         is_tree, score = classify(r)
-        if is_tree:
+        if is_tree and get_date(r) >= cutoff:
             r["_score"] = score
             found.append(r)
-    if not found: return {"status": "no leads"}
+    if not found: return {"status": "no new leads"}
     found.sort(key=lambda x: x["_score"], reverse=True)
     best = found[0]
     
-    # AI Extraction
-    txt = f"Ref: {best.get('REFVAL')} Addr: {best.get('ADDRESS')} Prop: {best.get('PROPOSAL') or best.get('DESCRIPT')}"
-    ai = client.chat.completions.create(
+    # AI Process
+    ai_msg = f"Ref: {best.get('REFVAL')} Addr: {best.get('ADDRESS')} Prop: {best.get('PROPOSAL')}"
+    ai_res = client.chat.completions.create(
         model="gpt-4o-mini",
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": "Return JSON: applicant_name, site_address, postcode, scope_summary, high_value (bool)"},
-            {"role": "user", "content": txt}
+            {"role": "user", "content": ai_msg}
         ]
     )
-    ld = json.loads(ai.choices[0].message.content)
+    ld = json.loads(ai_res.choices[0].message.content)
     
-    # Get Contractors
+    # Contractors
     cons = []
     if SURL:
         try:
@@ -123,8 +136,7 @@ def scrape(x_trigger_secret: str = Header(default=None)):
             cancel_url=f"{P_URL}/payment-cancelled",
             metadata={"surgeon_id": str(cn["id"]), "postcode": ld.get("postcode", ""), "site_address": ld.get("site_address", ""), "ref": best.get("REFVAL", "")}
         )
-        body = f"Hi {cn['name']}, New Tree Job: {ld['scope_summary']}. Link: {sess.url}"
-        requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [cn["email"]], "subject": "New Lead", "text": body}, headers={"Authorization": f"Bearer {R_KEY}", "Content-Type": "application/json"})
+        requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [cn["email"]], "subject": "New Lead", "text": f"New Job: {ld['scope_summary']}. Link: {sess.url}"}, headers={"Authorization": f"Bearer {R_KEY}", "Content-Type": "application/json"})
 
     return {"status": "sent", "address": ld["site_address"]}
 
@@ -139,8 +151,7 @@ async def webhook(req: Request):
             if sess["id"] not in _processed:
                 _processed.add(sess["id"])
                 m = sess["metadata"]
-                msg = f"PAID: {m.get('ref')} - {m.get('site_address')}"
-                requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [T_EM], "subject": "Lead Paid!", "text": msg}, headers={"Authorization": f"Bearer {R_KEY}", "Content-Type": "application/json"})
+                requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [T_EM], "subject": "Lead Paid!", "text": f"PAID: {m.get('ref')} - {m.get('site_address')}"}, headers={"Authorization": f"Bearer {R_KEY}", "Content-Type": "application/json"})
     except: pass
     return {"status": "ok"}
 
