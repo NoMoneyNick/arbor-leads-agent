@@ -11,7 +11,7 @@ import stripe
 
 
 # ============================================================
-# VECTOR DATA LABS - LEEDS PRODUCTION VERSION 1.8
+# VECTOR DATA LABS - LEEDS PRODUCTION VERSION 1.9
 # ============================================================
 
 app = FastAPI()
@@ -109,7 +109,7 @@ def fetch_single_batch(offset, size=150):
         "outFields": target_fields,
         "returnGeometry": "false",
         "resultRecordCount": size,
-        "resultOffset": offset, # This is the magic "pagination" part
+        "resultOffset": offset,
         "f": "json",
     }
     try:
@@ -119,23 +119,20 @@ def fetch_single_batch(offset, size=150):
         features = data.get("features", [])
         return [f.get("attributes", {}) for f in features]
     except Exception as e:
-        logger.error(f"Batch at offset {offset} failed: {e}")
+        logger.error(f"Batch failed: {e}")
         return []
 
 def fetch_leeds_records_full():
     """Fetches multiple batches and merges them."""
     all_records = []
-    
-    # We will ask for 3 batches of 150 records (450 total)
+    # Fetch 3 batches of 150 (450 total)
     for i in range(3):
         offset = i * 150
-        logger.info(f"Fetching batch {i+1} (Offset: {offset})...")
         batch = fetch_single_batch(offset)
         if not batch:
             break
         all_records.extend(batch)
         
-    # Sort everything by date (newest first)
     all_records.sort(key=lambda x: get_best_date(x), reverse=True)
     return all_records
 
@@ -145,12 +142,11 @@ def fetch_leeds_records_full():
 
 @app.get("/")
 def health_check():
-    return {"status": "Leeds Tree Agent V1.8 Active"}
+    return {"status": "Leeds Tree Agent V1.9 Active"}
 
 @app.get("/test-leeds")
 def test_leeds():
     raw_records = fetch_leeds_records_full()
-    
     cutoff_ms = (datetime.now(timezone.utc) - timedelta(days=120)).timestamp() * 1000
     
     valid_leads = []
@@ -158,7 +154,6 @@ def test_leeds():
     
     for r in raw_records:
         date_val = get_best_date(r)
-        
         if date_val > 0 and len(debug_dates) < 5:
             readable = datetime.fromtimestamp(date_val/1000, tz=timezone.utc).strftime("%Y-%m-%d")
             debug_dates.append(readable)
@@ -171,9 +166,8 @@ def test_leeds():
                 valid_leads.append(r)
 
     return {
-        "batches_merged": 3,
         "total_downloaded": len(raw_records),
-        "newest_dates_found": debug_dates,
+        "newest_dates_on_server": debug_dates,
         "tree_leads_found": len(valid_leads),
         "leads": valid_leads
     }
@@ -217,4 +211,8 @@ def trigger_scrape(x_trigger_secret: str = Header(default=None)):
 # ============================================================
 
 def extract_lead_with_openai(record):
-    raw_text = f"Ref:
+    # Using triple quotes to prevent SyntaxErrors during copy-paste
+    raw_text = f"""
+    Reference: {record.get('REFVAL')}
+    Address: {record.get('ADDRESS')}
+    Proposal: {record.get('PROPOSA
