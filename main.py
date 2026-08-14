@@ -7,7 +7,7 @@ from openai import OpenAI
 # Silence SSL warnings for councils with internal/self-signed certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="Vector Data Labs - V9.1 London Breakthrough", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs - V9.2 London Siege", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
@@ -22,26 +22,26 @@ client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# --- THE LONDON SHOTGUN LIST (V9.1 Verified Service Names) ---
+# --- THE LONDON Siege List (V9.2 Verified Service Paths) ---
 COUNCILS = {
     "Leeds_Control": {
         "url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query",
         "referer": "https://www.leeds.gov.uk/"
     },
     "Richmond_Wandsworth": {
-        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications/FeatureServer/0/query",
+        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications_Public/FeatureServer/0/query",
         "referer": "https://www.wandsworth.gov.uk/"
     },
     "Redbridge_London": {
-        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications_Redbridge/FeatureServer/0/query",
+        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications_Redbridge_Public/FeatureServer/0/query",
         "referer": "https://www.redbridge.gov.uk/"
     },
     "Havering_London": {
-        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications_Havering/FeatureServer/0/query",
+        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications_Havering_Public/FeatureServer/0/query",
         "referer": "https://www.havering.gov.uk/"
     },
-    "London_Datahub_V1": {
-        "url": "https://maps.london.gov.uk/arcgis/rest/services/apps/planning_data_map_01/MapServer/1/query",
+    "London_Mega_Hub": {
+        "url": "https://maps.london.gov.uk/arcgis/rest/services/apps/planning_data_map_02/MapServer/0/query",
         "referer": "https://www.london.gov.uk/"
     }
 }
@@ -49,7 +49,7 @@ COUNCILS = {
 # --- WEB PAGES ---
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def lander():
-    return f"<html><body style='font-family:sans-serif;text-align:center;'><h1>Vector Data Labs V9.1</h1><p>Leeds & London Siege</p><a href='/test-regional'>Run Health Check</a></body></html>"
+    return f"<html><body style='font-family:sans-serif;text-align:center;'><h1>Vector Data Labs V9.2</h1><p>Leeds Active | London Siege In Progress</p><a href='/test-regional'>Run Health Check</a></body></html>"
 
 # --- CLASSIFICATION LOGIC (DNA PRESERVED) ---
 TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "stump", "arboriculture", "oak", "ash ", "cedar", "conifer", "birch", "maple", "willow"]
@@ -70,11 +70,11 @@ def classify(r):
     if any(w in p for w in SKIP_WORDS) and score < 8: return False, 0
     return (score > 2), score
 
-# --- FETCHING LOGIC (ENHANCED) ---
+# --- FETCHING LOGIC (With JSON Fail-Safe) ---
 def fetch_council(name, config):
     url = config["url"]
     h = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         "Referer": config["referer"],
         "Accept": "application/json"
     }
@@ -82,9 +82,17 @@ def fetch_council(name, config):
     
     try:
         res = requests.get(url, params=q, headers=h, timeout=15, verify=False)
-        data = res.json()
+        if res.status_code != 200:
+            return [], f"HTTP {res.status_code} Error"
+        
+        try:
+            data = res.json()
+        except Exception:
+            return [], "Server returned HTML instead of JSON"
+
         if "error" in data:
             return [], f"ArcGIS Error: {data['error'].get('message')}"
+        
         features = data.get("features", [])
         return [f.get("attributes", {}) for f in features], "Success"
     except Exception as e:
@@ -142,7 +150,6 @@ def scrape(secret: str = Query(...)):
                     ld = json.loads(ai.choices[0].message.content)
                 except: continue
 
-                # Get Surgeons
                 surgeons = []
                 if SURL:
                     try:
@@ -161,7 +168,7 @@ def scrape(secret: str = Query(...)):
                         mode="payment", success_url=f"{P_URL}/payment-success", cancel_url=f"{P_URL}/payment-cancelled",
                         metadata={"surgeon_id": str(sgn["id"]), "ref": ref, "site_address": ld.get("site_address")}
                     )
-                    requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [sgn["email"]], "subject": f"Lead: {ld.get('site_address')}", "html": f"<h3>New Lead</h3><p>{ld['scope_summary']}</p><a href='{checkout.url}'>Buy Lead</a>"}, headers={"Authorization": f"Bearer {R_KEY}"})
+                    requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [sgn["email"]], "subject": f"London Lead: {ld.get('site_address')}", "html": f"<h3>New Lead</h3><p>{ld['scope_summary']}</p><a href='{checkout.url}'>Buy Lead</a>"}, headers={"Authorization": f"Bearer {R_KEY}"})
                 
                 mark_as_sent(ref)
                 leads_sent += 1
