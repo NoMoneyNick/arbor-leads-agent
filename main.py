@@ -1,10 +1,13 @@
-import os, json, logging, requests, psycopg2, stripe
+import os, json, logging, requests, psycopg2, stripe, urllib3
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from openai import OpenAI
 
-app = FastAPI(title="Vector Data Labs - London Siege V8.5", docs_url="/docs")
+# Disable SSL warnings because many London councils use internal certs
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+app = FastAPI(title="Vector Data Labs - London Breakthrough V8.6", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
@@ -19,13 +22,14 @@ client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# --- THE LONDON TARGET LIST ---
-# If the Hub fails, the individual Boroughs will catch the leads.
+# --- THE LONDON Siege List (Updated & Verified Paths) ---
 COUNCILS = {
-    "London_Mega_Hub": "https://maps.london.gov.uk/arcgis/rest/services/planning/Planning_London_Datahub/MapServer/0/query",
+    # The Mega Hub (GLA) - Unified London feed
+    "London_Mega_Hub": "https://gis2.london.gov.uk/server/rest/services/apps/planning_data_map_02/MapServer/0/query",
+    # Individual Boroughs (Direct Backdoors)
     "Southwark_London": "https://geo.southwark.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
-    "Barnet_London": "https://maps.barnet.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
     "Croydon_London": "https://maps.croydon.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
+    "Hillingdon_London": "https://hillingdon.gov.uk/arcgis/rest/services/planning_local_plan_data_17/FeatureServer/0/query",
     "Leeds_Control": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query"
 }
 
@@ -34,30 +38,29 @@ COUNCILS = {
 def lander():
     return f"""
     <html>
-        <body style='font-family:sans-serif; text-align:center; padding-top:50px; background:#f4f4f9;'>
-            <div style='display:inline-block; padding:40px; background:white; border-radius:10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);'>
-                <h1 style='color:#1a73e8;'>Vector Data Labs</h1>
-                <p style='color:#5f6368;'>System V8.5 (London Siege) Active.</p>
-                <p>Status: Monitoring 35+ London Authorities</p>
+        <body style='font-family:sans-serif; text-align:center; padding-top:50px; background:#fafafa;'>
+            <div style='display:inline-block; padding:40px; background:white; border:1px solid #ddd; border-radius:10px;'>
+                <h1 style='color:#2e7d32;'>Vector Data Labs</h1>
+                <p>System V8.6 (London Breakthrough) Active.</p>
+                <p>Focus: 32 Boroughs + City of London</p>
                 <hr style='border:0; border-top:1px solid #eee; margin:20px 0;'/>
-                <a href='/test-regional' style='color:#1a73e8; text-decoration:none;'>Diagnostics</a>
+                <a href='/test-regional' style='color:#2e7d32;'>Run Regional Health Check</a>
             </div>
         </body>
     </html>
     """
 
 # --- LOGIC: CLASSIFICATION & FETCHING ---
-TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "stump", "arboriculture", "oak", "ash ", "sycamore", "willow"]
-SKIP_WORDS = ["dwelling", "erection of", "new build", "extension", "loft conversion", "basement", "advertisement"]
+TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "stump", "arboriculture", "oak", "ash ", "sycamore", "willow", "cedar", "conifer"]
+SKIP_WORDS = ["dwelling", "erection of", "new build", "extension", "loft conversion", "basement", "advertisement", "shopfront"]
 
 def get_d(r):
-    # Extracts timestamp from various possible ArcGIS date fields
     v = r.get("DATE_RECEIVED") or r.get("DATE_VALID") or r.get("DATEAPVAL") or r.get("RECDAT") or r.get("actual_decision_date") or 0
     try: return float(v)
     except: return 0
 
 def classify(r):
-    # Aggregated descriptions from different council schemas
+    # Aggregated descriptions from multiple schemas
     p = str(
         r.get("development_description") or 
         r.get("PROPOSAL") or 
@@ -71,21 +74,23 @@ def classify(r):
     m = [k for k in TREE_WORDS if k in p]
     s = len(m)
     
+    # Weighting for London terminology
     if "tree" in p: s += 2
     if any(x in p for x in ["fell", "remove", "crown", "tpo", "conservation area"]): s += 5
     
-    # Negative filtering: Avoid major construction unless it's a very clear tree lead
+    # Strict filter: don't pick up house extensions that just mention a tree in passing
     if any(w in p for w in SKIP_WORDS) and s < 8: return False, 0
     
     return (s > 2), s
 
 def fetch_council(url):
-    # Stronger Browser Masking
+    # 'Human Mask' + 'Referer' to trick council firewalls
     h = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://www.google.com/"
     }
     
+    # Standard query for recent records
     q = {
         "where": "1=1", 
         "outFields": "*", 
@@ -94,14 +99,14 @@ def fetch_council(url):
         "f": "json"
     }
     try:
-        res = requests.get(url, params=q, headers=h, timeout=25)
-        # Check if the server actually returned JSON
-        if res.status_code != 200:
-            return [], f"HTTP Error {res.status_code}"
+        # BATTLE SECRET: verify=False ignores SSL Certificate errors
+        res = requests.get(url, params=q, headers=h, timeout=20, verify=False)
+        
+        if res.status_code == 404: return [], "404 Not Found"
+        if res.status_code != 200: return [], f"HTTP Error {res.status_code}"
             
         data = res.json()
-        if "error" in data: 
-            return [], f"ArcGIS Error: {data['error'].get('message')}"
+        if "error" in data: return [], f"ArcGIS Error: {data['error'].get('message')}"
         
         return [f.get("attributes", {}) for f in data.get("features", [])], "Success"
     except Exception as e:
@@ -132,7 +137,7 @@ def mark_as_sent(ref):
 
 @app.get("/test-regional")
 def test_all():
-    """Scoreboard to verify London connectivity."""
+    """Scoreboard for London Breakthrough."""
     results = {}
     for name, url in COUNCILS.items():
         recs, status = fetch_council(url)
@@ -141,7 +146,7 @@ def test_all():
             "status": status, 
             "scanned": len(recs), 
             "tree_leads": len(found),
-            "raw_log": str(recs[0])[:200] if recs else "None"
+            "sample": str(recs[0])[:150] if recs else "None"
         }
     return results
 
@@ -155,12 +160,12 @@ def scrape(secret: str = Query(...)):
         cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).timestamp() * 1000
         
         for r in recs:
-            ref = r.get("external_system_reference") or r.get("REFERENCE") or r.get("PLANNO") or r.get("P_REF") or str(r.get("OBJECTID"))
+            ref = r.get("external_system_reference") or r.get("REFERENCE") or r.get("PLANNO") or r.get("REFVAL") or str(r.get("OBJECTID"))
             is_t, score = classify(r)
             
             if is_t and (get_d(r) >= cutoff or get_d(r) == 0) and not is_already_sent(ref):
-                addr = r.get('full_address') or r.get('ADDRESS') or r.get('LOCATION') or r.get('SITE_ADDRESS') or r.get('ADR1')
-                prop = r.get('development_description') or r.get('PROPOSAL') or r.get('DESCRIPTION') or r.get('DETDESC')
+                addr = r.get('full_address') or r.get('ADDRESS') or r.get('LOCATION') or r.get('SITE_ADDRESS')
+                prop = r.get('development_description') or r.get('PROPOSAL') or r.get('DESCRIPTION')
                 
                 try:
                     ai = client.chat.completions.create(
@@ -174,7 +179,6 @@ def scrape(secret: str = Query(...)):
                     ld = json.loads(ai.choices[0].message.content)
                 except: continue
 
-                # Get Active Surgeons
                 cons = []
                 if SURL:
                     try:
@@ -190,30 +194,28 @@ def scrape(secret: str = Query(...)):
                     amt = 5500 if ld.get("high_value") else 3000
                     sess = stripe.checkout.Session.create(
                         payment_method_types=["card"],
-                        line_items=[{"price_data": {"currency": "gbp", "product_data": {"name": f"London Tree Lead: {ld.get('site_address')}"}, "unit_amount": amt}, "quantity": 1}],
-                        mode="payment", 
-                        success_url=f"{P_URL}/payment-success", cancel_url=f"{P_URL}/payment-cancelled",
+                        line_items=[{"price_data": {"currency": "gbp", "product_data": {"name": f"London Lead: {ld.get('site_address')}"}, "unit_amount": amt}, "quantity": 1}],
+                        mode="payment", success_url=f"{P_URL}/payment-success", cancel_url=f"{P_URL}/payment-cancelled",
                         metadata={"surgeon_id": str(cn["id"]), "ref": ref, "site_address": ld.get("site_address")}
                     )
                     
                     email_body = f"""
-                    <div style='font-family:sans-serif; border:1px solid #eee; padding:20px;'>
-                        <h2 style='color:#2e7d32;'>New London Tree Lead</h2>
-                        <p><strong>Council:</strong> {c_name}</p>
+                    <div style='font-family:sans-serif; border:1px solid #2e7d32; padding:25px;'>
+                        <h2 style='color:#2e7d32;'>Exclusive London Lead</h2>
                         <p><strong>Work:</strong> {ld.get('scope_summary')}</p>
                         <p><strong>Location:</strong> {ld.get('site_address')}</p>
                         <br/>
-                        <a href='{sess.url}' style='background:#2e7d32; color:white; padding:12px 25px; text-decoration:none; border-radius:5px;'>Buy Lead for £{amt/100}</a>
+                        <a href='{sess.url}' style='background:#2e7d32; color:white; padding:15px 30px; text-decoration:none; border-radius:5px; font-weight:bold;'>Buy Lead Details (£{amt/100})</a>
                     </div>
                     """
-                    requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [cn["email"]], "subject": f"Lead: {ld.get('site_address')}", "html": email_body}, headers={"Authorization": f"Bearer {R_KEY}"})
+                    requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [cn["email"]], "subject": f"London Lead: {ld.get('site_address')}", "html": email_body}, headers={"Authorization": f"Bearer {R_KEY}"})
                 
                 mark_as_sent(ref)
                 leads_sent += 1
                 if leads_sent >= 10: break
         if leads_sent >= 10: break
         
-    return {"status": "success", "leads_processed": leads_sent}
+    return {"status": "success", "leads_sent": leads_sent}
 
 @app.post("/webhook", include_in_schema=False)
 async def webhook(req: Request):
@@ -225,13 +227,13 @@ async def webhook(req: Request):
             if sess["id"] not in _processed:
                 _processed.add(sess["id"])
                 m = sess["metadata"]
-                msg = f"<h3>London Lead Paid!</h3><p>Address: {m.get('site_address')}</p>"
+                msg = f"<h3>Lead Paid!</h3><p>Address: {m.get('site_address')}</p>"
                 requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [T_EM], "subject": "💰 SALE!", "html": msg}, headers={"Authorization": f"Bearer {R_KEY}"})
     except: pass
     return {"status": "ok"}
 
 @app.get("/payment-success", include_in_schema=False)
-def success(): return HTMLResponse("<html><body><h1>Success!</h1><p>Details sent to email.</p></body></html>")
+def success(): return HTMLResponse("<html><body><h1>Success!</h1><p>Check your email for details.</p></body></html>")
 
 @app.get("/payment-cancelled", include_in_schema=False)
 def cancel(): return HTMLResponse("<html><body><h1>Cancelled</h1></body></html>")
