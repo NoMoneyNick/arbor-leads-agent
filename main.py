@@ -33,10 +33,8 @@ TEST_EMAIL = os.getenv("TEST_EMAIL")
 
 TRIGGER_SECRET = os.getenv("TRIGGER_SECRET")
 
-# Your Render application URL.
 PUBLIC_APP_URL = os.getenv("PUBLIC_APP_URL")
 
-# Resend API endpoint
 RESEND_URL = "https://api.resend.com/emails"
 
 
@@ -55,8 +53,12 @@ REQUIRED_ENV_VARS = {
 # ============================================================
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
 stripe.api_key = STRIPE_SECRET_KEY
 
+
+# Fallback store for webhook idempotency.
+# The database path is preferred when available.
 _processed_sessions_memory = set()
 
 
@@ -161,7 +163,7 @@ def send_test_email(
     except Exception:
         return {
             "status": "sent",
-            "http_status": response.status_code,
+            "http_status": response.status_code
         }
 
 
@@ -198,14 +200,12 @@ def get_test_contractors():
 
             for contractor_id, name, email in rows:
 
-                contractors.append(
-                    {
-                        "id": contractor_id,
-                        "name": name,
-                        "email": email,
-                        "distance": 4.2,
-                    }
-                )
+                contractors.append({
+                    "id": contractor_id,
+                    "name": name,
+                    "email": email,
+                    "distance": 4.2,
+                })
 
             logger.info(
                 "Database returned %s contractors",
@@ -230,14 +230,12 @@ def get_test_contractors():
             "Using TEST CONTRACTOR"
         )
 
-        contractors.append(
-            {
-                "id": 1,
-                "name": "Test Contractor",
-                "email": TEST_EMAIL,
-                "distance": 4.2,
-            }
-        )
+        contractors.append({
+            "id": 1,
+            "name": "Test Contractor",
+            "email": TEST_EMAIL,
+            "distance": 4.2,
+        })
 
     return contractors
 
@@ -249,12 +247,12 @@ def get_test_contractors():
 def mark_session_processed(session_id: str) -> bool:
 
     """
-    Returns True the first time a Stripe session is seen.
+    Returns True the first time a Stripe session id is seen.
 
-    Returns False if the same session is received again.
+    Returns False if the same session has already been processed.
 
-    This prevents duplicate unlock emails when Stripe retries
-    a webhook.
+    This prevents Stripe webhook retries from sending duplicate
+    unlocked-lead emails.
     """
 
     if SUPABASE_DB_URL:
@@ -340,6 +338,7 @@ def trigger_scrape(
         "TEST PIPELINE STARTED"
     )
 
+
     # ========================================================
     # 1. MOCK COUNCIL DATA
     # ========================================================
@@ -353,28 +352,23 @@ def trigger_scrape(
         "Applicant: Mr. Julian Vance."
     )
 
+
     # ========================================================
     # 2. OPENAI EXTRACTION
     # ========================================================
 
     system_prompt = (
-
         "You are a senior UK Planning Data Engineer.\n\n"
-
         "Analyze raw text from council planning portals.\n\n"
-
         "Extract:\n"
         "- Applicant Name\n"
         "- Site Address\n"
         "- Postcode\n"
         "- Scope Summary\n\n"
-
         "If work involves major felling, sectional "
         "takedowns, or mature TPO trees, set high_value "
         "to true.\n\n"
-
         "Return strictly JSON matching this structure:\n\n"
-
         "{\n"
         '  "applicant_name": "String",\n'
         '  "site_address": "String",\n'
@@ -383,6 +377,7 @@ def trigger_scrape(
         '  "high_value": true\n'
         "}"
     )
+
 
     try:
 
@@ -409,8 +404,10 @@ def trigger_scrape(
         )
 
         raw_content = (
-            response.choices[0]
-            .message.content
+            response
+            .choices[0]
+            .message
+            .content
         )
 
         if not raw_content:
@@ -433,6 +430,7 @@ def trigger_scrape(
             status_code=500,
             detail="OpenAI extraction failed"
         )
+
 
     # ========================================================
     # 3. CHECK EXTRACTED DATA
@@ -460,11 +458,13 @@ def trigger_scrape(
         refined_lead
     )
 
+
     # ========================================================
     # 4. GET TEST CONTRACTORS
     # ========================================================
 
     contractors = get_test_contractors()
+
 
     # ========================================================
     # 5. SEND PAYMENT LINKS
@@ -477,6 +477,7 @@ def trigger_scrape(
     )
 
     contractor_results = []
+
 
     for contractor in contractors:
 
@@ -497,7 +498,7 @@ def trigger_scrape(
                             "product_data": {
                                 "name":
                                     f"TEST - Exclusive Tree Lead - "
-                                    f"{refined_lead['postcode']}"
+                                    f"{refined_lead['postcode']}",
                             },
 
                             "unit_amount": unit_amount,
@@ -522,6 +523,7 @@ def trigger_scrape(
                 ),
 
                 metadata={
+
                     "surgeon_id":
                         str(contractor["id"]),
 
@@ -538,6 +540,7 @@ def trigger_scrape(
                         refined_lead["scope_summary"],
                 },
             )
+
 
             email_body = (
 
@@ -562,12 +565,13 @@ def trigger_scrape(
 
                 f"{session.url}\n\n"
 
-                "The payment link is part of the "
-                "Stripe testing workflow.\n\n"
+                "The payment link is part of "
+                "the Stripe testing workflow.\n\n"
 
                 "Best regards,\n"
                 "Vector Data Labs Test System"
             )
+
 
             send_test_email(
 
@@ -583,23 +587,25 @@ def trigger_scrape(
                 sender_name="Vector Data Labs Test",
             )
 
-            contractor_results.append(
-                {
-                    "contractor_id":
-                        contractor["id"],
 
-                    "status":
-                        "payment_link_sent",
+            contractor_results.append({
 
-                    "stripe_session_created":
-                        True,
-                }
-            )
+                "contractor_id":
+                    contractor["id"],
+
+                "status":
+                    "payment_link_sent",
+
+                "stripe_session_created":
+                    True,
+            })
+
 
             logger.info(
                 "Test payment link sent to contractor %s",
                 contractor["id"]
             )
+
 
         except Exception as exc:
 
@@ -607,18 +613,18 @@ def trigger_scrape(
                 "Failed contractor test"
             )
 
-            contractor_results.append(
-                {
-                    "contractor_id":
-                        contractor["id"],
+            contractor_results.append({
 
-                    "status":
-                        "failed",
+                "contractor_id":
+                    contractor["id"],
 
-                    "error":
-                        str(exc),
-                }
-            )
+                "status":
+                    "failed",
+
+                "error":
+                    str(exc),
+            })
+
 
     # ========================================================
     # 6. RETURN TEST RESULT
@@ -645,9 +651,16 @@ def trigger_scrape(
 # ============================================================
 
 @app.post("/webhook")
-async def stripe_webhook(
-    request: Request
-):
+async def stripe_webhook(request: Request):
+
+    logger.info(
+        "STRIPE WEBHOOK RECEIVED"
+    )
+
+
+    # ========================================================
+    # 1. READ RAW STRIPE REQUEST
+    # ========================================================
 
     payload = await request.body()
 
@@ -655,9 +668,14 @@ async def stripe_webhook(
         "stripe-signature"
     )
 
+
+    # ========================================================
+    # 2. CHECK WEBHOOK SECRET
+    # ========================================================
+
     if not STRIPE_WEBHOOK_SECRET:
 
-        logger.warning(
+        logger.error(
             "STRIPE_WEBHOOK_SECRET not configured"
         )
 
@@ -666,15 +684,25 @@ async def stripe_webhook(
             detail="Stripe webhook secret missing"
         )
 
+
+    # ========================================================
+    # 3. CHECK SIGNATURE
+    # ========================================================
+
     if not signature:
+
+        logger.error(
+            "Stripe signature missing"
+        )
 
         raise HTTPException(
             status_code=400,
             detail="Stripe signature missing"
         )
 
+
     # ========================================================
-    # VERIFY STRIPE WEBHOOK
+    # 4. VERIFY STRIPE EVENT
     # ========================================================
 
     try:
@@ -687,6 +715,10 @@ async def stripe_webhook(
 
     except ValueError:
 
+        logger.exception(
+            "Invalid Stripe webhook payload"
+        )
+
         raise HTTPException(
             status_code=400,
             detail="Invalid webhook payload"
@@ -694,43 +726,128 @@ async def stripe_webhook(
 
     except stripe.StripeError:
 
+        logger.exception(
+            "Invalid Stripe webhook signature"
+        )
+
         raise HTTPException(
             status_code=400,
             detail="Invalid Stripe webhook signature"
         )
 
+
+    logger.info(
+        "Stripe event received: %s",
+        event["type"]
+    )
+
+
     # ========================================================
-    # IGNORE EVENTS WE DON'T NEED
+    # 5. IGNORE EVENTS WE DON'T NEED
     # ========================================================
 
     if event["type"] != "checkout.session.completed":
+
+        logger.info(
+            "Ignoring Stripe event type: %s",
+            event["type"]
+        )
 
         return {
             "status": "Event ignored"
         }
 
+
     # ========================================================
-    # GET STRIPE CHECKOUT SESSION
+    # 6. GET CHECKOUT SESSION
     # ========================================================
 
     session = event["data"]["object"]
 
+
     # IMPORTANT:
-    # Stripe gives us a Stripe object here, not a normal
-    # Python dictionary. Therefore we use .id and .metadata
-    # instead of .get().
-    
-    session_id = session.id
+    #
+    # DO NOT USE:
+    #
+    # session.get(...)
+    #
+    # StripeObject does not support .get() in this environment.
+    #
+    # Use [] instead.
 
-    metadata = session.metadata or {}
+    session_id = session["id"]
+
 
     # ========================================================
-    # PREVENT DUPLICATE EMAILS
+    # 7. GET METADATA
     # ========================================================
 
-    if not mark_session_processed(
+    metadata = session["metadata"]
+
+
+    # IMPORTANT:
+    #
+    # DO NOT USE:
+    #
+    # metadata.get(...)
+    #
+    # Use [] with existence checks instead.
+
+    if "surgeon_id" in metadata:
+        surgeon_id = metadata["surgeon_id"]
+    else:
+        surgeon_id = None
+
+
+    if "postcode" in metadata:
+        postcode = metadata["postcode"]
+    else:
+        postcode = "Unknown"
+
+
+    if "site_address" in metadata:
+        site_address = metadata["site_address"]
+    else:
+        site_address = "Unknown"
+
+
+    if "applicant_name" in metadata:
+        applicant_name = metadata["applicant_name"]
+    else:
+        applicant_name = "Unknown"
+
+
+    if "scope_summary" in metadata:
+        scope_summary = metadata["scope_summary"]
+    else:
+        scope_summary = "Unknown"
+
+
+    # ========================================================
+    # 8. LOG PAYMENT INFORMATION
+    # ========================================================
+
+    logger.info(
+        "Stripe checkout completed: %s",
         session_id
-    ):
+    )
+
+    logger.info(
+        "Surgeon ID: %s",
+        surgeon_id
+    )
+
+    logger.info(
+        "Postcode: %s",
+        postcode
+    )
+
+
+    # ========================================================
+    # 9. PREVENT DUPLICATE WEBHOOK PROCESSING
+    # ========================================================
+
+    if not mark_session_processed(session_id):
 
         logger.info(
             "Session %s already processed, "
@@ -746,48 +863,23 @@ async def stripe_webhook(
                 session_id,
         }
 
+
     # ========================================================
-    # READ LEAD DATA
+    # 10. PAYMENT CONFIRMED
     # ========================================================
-
-    surgeon_id = metadata.get(
-        "surgeon_id"
-    )
-
-    postcode = metadata.get(
-        "postcode",
-        "Unknown"
-    )
-
-    site_address = metadata.get(
-        "site_address",
-        "Unknown"
-    )
-
-    applicant_name = metadata.get(
-        "applicant_name",
-        "Unknown"
-    )
-
-    scope_summary = metadata.get(
-        "scope_summary",
-        "Unknown"
-    )
 
     logger.info(
         "TEST PAYMENT COMPLETED for surgeon %s",
         surgeon_id
     )
 
+
     # ========================================================
-    # TEST EMAIL RECIPIENT
+    # 11. SEND TEST UNLOCK EMAIL
     # ========================================================
 
     recipient = TEST_EMAIL
 
-    # ========================================================
-    # BUILD UNLOCK EMAIL
-    # ========================================================
 
     unlock_body = (
 
@@ -819,9 +911,6 @@ async def stripe_webhook(
         "Vector Data Labs Test System"
     )
 
-    # ========================================================
-    # SEND UNLOCK EMAIL
-    # ========================================================
 
     try:
 
@@ -830,14 +919,15 @@ async def stripe_webhook(
             recipient=recipient,
 
             subject=(
-                f"[TEST UNLOCKED] Tree Lead - "
-                f"{postcode}"
+                f"[TEST UNLOCKED] "
+                f"Tree Lead - {postcode}"
             ),
 
             body=unlock_body,
 
             sender_name="Vector Data Labs Test",
         )
+
 
     except Exception:
 
@@ -846,21 +936,34 @@ async def stripe_webhook(
         )
 
         raise HTTPException(
+
             status_code=500,
+
             detail=(
                 "Payment received but "
                 "test email failed"
             )
         )
 
+
     # ========================================================
-    # SUCCESS
+    # 12. SUCCESS
     # ========================================================
+
+    logger.info(
+        "TEST PAYMENT SUCCESSFULLY PROCESSED "
+        "for surgeon %s",
+        surgeon_id
+    )
+
 
     return {
 
         "status":
             "TEST PAYMENT PROCESSED",
+
+        "session_id":
+            session_id,
 
         "surgeon_id":
             surgeon_id,
