@@ -1,7 +1,7 @@
-import os, json, logging, requests, psycopg2, stripe, math
+import os, json, logging, requests, psycopg2, stripe
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, HTTPException, Query
-from fastapi.responses import HTML_Response
+from fastapi.responses import HTMLResponse
 from openai import OpenAI
 
 app = FastAPI(title="Vector Data Labs", docs_url="/docs")
@@ -22,21 +22,21 @@ _processed = set()
 
 # --- WEB PAGES FOR STRIPE ---
 
-@app.get("/", response_class=HTML_Response, include_in_schema=False)
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def lander():
     return """
-    <html><head><title>Vector Data Labs</title><style>body{font-family:sans-serif;line-height:1.6;max-width:800px;margin:auto;padding:50px;color:#333;} h1{color:#2e7d32;} .btn{background:#2e7d32;color:white;padding:10px 20px;text-decoration:none;border-radius:5px;}</style></head>
+    <html><head><title>Vector Data Labs</title><style>body{font-family:sans-serif;line-height:1.6;max-width:800px;margin:auto;padding:50px;color:#333;} h1{color:#2e7d32;} </style></head>
     <body><h1>Vector Data Labs</h1><p>High-quality, real-time lead generation for UK arboricultural contractors.</p>
     <p>We monitor council planning portals to identify Tree Preservation Order (TPO) and Conservation Area applications, delivering exclusive leads directly to your inbox.</p>
     <p><strong>Contact:</strong> """ + str(T_EM) + """</p>
     <hr/><p style='font-size:12px;'><a href='/terms'>Terms of Service</a> | <a href='/privacy'>Privacy Policy</a></p></body></html>
     """
 
-@app.get("/terms", response_class=HTML_Response, include_in_schema=False)
+@app.get("/terms", response_class=HTMLResponse, include_in_schema=False)
 def terms():
     return "<html><body><h1>Terms of Service</h1><p>Vector Data Labs provides information services. All sales are final. We do not guarantee the accuracy of council data.</p></body></html>"
 
-@app.get("/privacy", response_class=HTML_Response, include_in_schema=False)
+@app.get("/privacy", response_class=HTMLResponse, include_in_schema=False)
 def privacy():
     return "<html><body><h1>Privacy Policy</h1><p>We only collect data necessary to process your lead purchases and provide alerts.</p></body></html>"
 
