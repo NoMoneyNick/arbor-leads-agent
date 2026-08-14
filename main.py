@@ -7,7 +7,7 @@ from openai import OpenAI
 # Silence SSL warnings for councils with internal/self-signed certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="Vector Data Labs - V9.4 London Reconstruction", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs - V9.5 London Siege", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
@@ -22,7 +22,8 @@ client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# --- THE LONDON RECONSTRUCTION LIST (V9.4 Verified Production Paths) ---
+# --- THE LONDON Siege List (V9.5 Cloud Clusters) ---
+# We use direct FeatureServer clusters which are harder for councils to 'hide'.
 COUNCILS = {
     "Leeds_Control": {
         "url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query",
@@ -33,41 +34,40 @@ COUNCILS = {
         "referer": "https://www.london.gov.uk/"
     },
     "Richmond_Wandsworth": {
-        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications/FeatureServer/0/query",
+        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications_Live/FeatureServer/0/query",
         "referer": "https://www.wandsworth.gov.uk/"
     },
-    "Southwark_London": {
-        "url": "https://geo.southwark.gov.uk/arcgis/rest/services/Planning/Planning_Applications/FeatureServer/0/query",
-        "referer": "https://www.southwark.gov.uk/"
+    "Bromley_London": {
+        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications/FeatureServer/0/query",
+        "referer": "https://www.bromley.gov.uk/"
     },
-    "Hackney_London": {
-        "url": "https://map.hackney.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
-        "referer": "https://www.hackney.gov.uk/"
+    "Tower_Hamlets_London": {
+        "url": "https://services.arcgis.com/6v9Y5S0p9Y7S9VlU/arcgis/rest/services/Planning_Applications/FeatureServer/0/query",
+        "referer": "https://www.towerhamlets.gov.uk/"
     }
 }
 
 # --- WEB PAGES ---
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def lander():
-    return f"<html><body style='font-family:sans-serif;text-align:center;'><h1>Vector Data Labs V9.4</h1><p>Leeds: ACTIVE | London: RECONSTRUCTION</p><a href='/test-regional'>Run Health Check</a></body></html>"
+    return f"<html><body style='font-family:sans-serif;text-align:center;'><h1>Vector Data Labs V9.5</h1><p>Leeds: ACTIVE | London: CLOUD CLUSTERS</p><a href='/test-regional'>Run Health Check</a></body></html>"
 
 # --- CLASSIFICATION LOGIC (DNA PRESERVED) ---
 TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "stump", "arboriculture", "oak", "ash ", "cedar", "conifer", "birch", "maple", "willow", "sycamore"]
 SKIP_WORDS = ["dwelling", "erection of", "new build", "extension", "loft conversion"]
 
 def get_d(r):
+    # London Hub uses DATE_RECEIVED, some FeatureServers use DATE_VALID
     v = r.get("DATE_RECEIVED") or r.get("DATE_VALID") or r.get("DATEAPVAL") or r.get("RECDAT") or 0
     try: return float(v)
     except: return 0
 
 def classify(r):
-    # Search all possible description fields
     p = str(
         r.get("development_description") or 
         r.get("PROPOSAL") or 
         r.get("DESCRIPTION") or 
-        r.get("DESCRIPT") or 
-        r.get("DETDESC") or ""
+        r.get("DESCRIPT") or ""
     ).lower()
     
     if not p: return False, 0
@@ -78,12 +78,12 @@ def classify(r):
     if "tree" in p: score += 2
     if any(x in p for x in ["fell", "remove", "crown", "tpo", "conservation area"]): score += 5
     
-    # Negative filtering for London
+    # Strict London filtering: Avoid extensions and new builds
     if any(w in p for w in SKIP_WORDS) and score < 8: return False, 0
     
     return (score > 2), score
 
-# --- FETCHING LOGIC (ENHANCED) ---
+# --- FETCHING LOGIC (DNA PRESERVED) ---
 def fetch_council(name, config):
     url = config["url"]
     h = {
@@ -91,8 +91,6 @@ def fetch_council(name, config):
         "Referer": config["referer"],
         "Accept": "application/json"
     }
-    
-    # Standard query for recent records
     q = {
         "where": "1=1", 
         "outFields": "*", 
@@ -100,21 +98,15 @@ def fetch_council(name, config):
         "orderByFields": "OBJECTID DESC", 
         "f": "json"
     }
-    
     try:
-        # BATTLE SECRET: verify=False is required for internal London certificates
         res = requests.get(url, params=q, headers=h, timeout=20, verify=False)
-        
         if res.status_code != 200:
             return [], f"HTTP {res.status_code} Error"
-            
         data = res.json()
         if "error" in data:
             return [], f"ArcGIS Error: {data['error'].get('message')}"
-        
         features = data.get("features", [])
         return [f.get("attributes", {}) for f in features], "Success"
-        
     except Exception as e:
         return [], f"Connection Fail: {str(e)}"
 
@@ -141,7 +133,6 @@ def mark_as_sent(ref):
 
 @app.get("/test-regional")
 def test_all():
-    """Diagnostic scoreboard."""
     results = {}
     for name, config in COUNCILS.items():
         recs, status = fetch_council(name, config)
@@ -156,33 +147,25 @@ def test_all():
 @app.get("/trigger-scrape")
 def scrape(secret: str = Query(...)):
     if secret != T_SEC: raise HTTPException(status_code=401)
-    
     leads_sent = 0
     for c_name, config in COUNCILS.items():
         recs, _ = fetch_council(c_name, config)
         cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).timestamp() * 1000
-        
         for r in recs:
-            ref = r.get("REFERENCE") or r.get("PLANNO") or r.get("REFVAL") or r.get("external_system_reference") or str(r.get("OBJECTID"))
+            ref = r.get("REFERENCE") or r.get("PLANNO") or r.get("REFVAL") or str(r.get("OBJECTID"))
             is_tree, _ = classify(r)
-            
             if is_tree and (get_d(r) >= cutoff or get_d(r) == 0) and not is_already_sent(ref):
                 addr = r.get('full_address') or r.get('ADDRESS') or r.get('LOCATION') or r.get('SITE_ADDRESS')
                 prop = r.get('development_description') or r.get('PROPOSAL') or r.get('DESCRIPTION')
-                
                 try:
                     ai = client.chat.completions.create(
-                        model="gpt-4o-mini", 
-                        response_format={"type": "json_object"},
-                        messages=[
-                            {"role": "system", "content": "Return JSON: applicant_name, site_address, postcode, scope_summary, high_value (bool)."},
-                            {"role": "user", "content": f"Addr: {addr} Prop: {prop}"}
-                        ]
+                        model="gpt-4o-mini", response_format={"type": "json_object"},
+                        messages=[{"role": "system", "content": "Return JSON: applicant_name, site_address, postcode, scope_summary, high_value (bool)."},
+                                  {"role": "user", "content": f"Addr: {addr} Prop: {prop}"}]
                     )
                     ld = json.loads(ai.choices[0].message.content)
                 except: continue
 
-                # Get Surgeons
                 surgeons = []
                 if SURL:
                     try:
@@ -191,7 +174,6 @@ def scrape(secret: str = Query(...)):
                         for row in c.fetchall(): surgeons.append({"id": row[0], "email": row[1]})
                         db.close()
                     except: pass
-                
                 if not surgeons: surgeons.append({"id": 1, "email": T_EM})
 
                 for sgn in surgeons:
@@ -202,23 +184,12 @@ def scrape(secret: str = Query(...)):
                         mode="payment", success_url=f"{P_URL}/payment-success", cancel_url=f"{P_URL}/payment-cancelled",
                         metadata={"surgeon_id": str(sgn["id"]), "ref": ref, "site_address": ld.get("site_address")}
                     )
-                    
-                    email_html = f"""
-                    <div style='font-family:sans-serif; border-left: 10px solid #2e7d32; padding:20px; background:#f9f9f9;'>
-                        <h2 style='color:#2e7d32;'>Exclusive Tree Lead: {c_name}</h2>
-                        <p><strong>Work:</strong> {ld.get('scope_summary')}</p>
-                        <p><strong>Location:</strong> {ld.get('site_address')}</p>
-                        <br/>
-                        <a href='{checkout.url}' style='background:#2e7d32; color:white; padding:12px 25px; text-decoration:none; border-radius:5px; font-weight:bold; display:inline-block;'>Buy Lead Details (£{amt/100})</a>
-                    </div>
-                    """
-                    requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [sgn["email"]], "subject": f"Lead: {ld.get('site_address')}", "html": email_html}, headers={"Authorization": f"Bearer {R_KEY}"})
+                    requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [sgn["email"]], "subject": f"Lead: {ld.get('site_address')}", "html": f"<h3>New Lead</h3><p>{ld['scope_summary']}</p><a href='{checkout.url}'>Buy Lead</a>"}, headers={"Authorization": f"Bearer {R_KEY}"})
                 
                 mark_as_sent(ref)
                 leads_sent += 1
                 if leads_sent >= 10: break
         if leads_sent >= 10: break
-        
     return {"status": "success", "leads_sent": leads_sent}
 
 @app.post("/webhook", include_in_schema=False)
