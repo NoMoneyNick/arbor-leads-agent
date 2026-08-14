@@ -20,12 +20,13 @@ client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# LOGIC
-TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "stump", "arboriculture", "conservation"]
-SKIP_WORDS = ["dwelling", "extension", "new build", "erection of"]
+# Expanded tree keywords
+TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "stump", "arboriculture", "conservation", "birch", "oak", "ash", "sycamore", "willow"]
+SKIP_WORDS = ["dwelling", "erection of", "new build"]
 
 def get_d(r):
-    v = r.get("DATEAPVAL") or r.get("DATE_RECEIVED") or 0
+    # Try all known Leeds date fields
+    v = r.get("DATEAPVAL") or r.get("DATE_RECEIVED") or r.get("DATE_VALID") or r.get("DATEDECISS") or 0
     return float(v)
 
 def classify(r):
@@ -34,19 +35,20 @@ def classify(r):
     m = [k for k in TREE_WORDS if k in p]
     s = len(m)
     if "tree" in p: s += 2
-    if any(x in p for x in ["fell", "remove", "crown", "tpo"]): s += 5
-    if any(w in p for w in SKIP_WORDS) and s < 7: return False, 0
+    if any(x in p for x in ["fell", "remove", "crown", "reduce", "thin"]): s += 5
+    is_bad = any(w in p for w in SKIP_WORDS)
+    if is_bad and s < 7: return False, 0
     return (s > 0), s
 
 def fetch():
     h = {"User-Agent": "Mozilla/5.0 Chrome/121.0.0.0", "Referer": "https://www.leeds.gov.uk/"}
-    # resultOffset=0 and orderByFields makes the server give us the LATEST records first
+    # We sort by OBJECTID DESC to get the newest entries first
     q = {
         "where": "1=1",
         "outFields": "*",
         "returnGeometry": "false",
         "resultRecordCount": 1000,
-        "orderByFields": "DATEAPVAL DESC",
+        "orderByFields": "OBJECTID DESC",
         "f": "json"
     }
     try:
@@ -56,30 +58,33 @@ def fetch():
     except: return []
 
 @app.get("/")
-def home(): return {"status": "V2.6 Sorting Active"}
+def home(): return {"status": "V2.7 ID-Sort Active"}
 
 @app.get("/test-leeds")
 def test():
     recs = fetch()
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=120)).timestamp() * 1000
+    # Looking for records in the last 6 months (Leeds updates can be slow)
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=180)).timestamp() * 1000
     leads = []
     samples = []
     
     for i, r in enumerate(recs):
-        if i < 5: # Capture first 5 for debugging
-            samples.append({"date": get_d(r), "text": r.get("PROPOSAL") or r.get("DESCRIPT")})
+        d = get_d(r)
+        if i < 5:
+            samples.append({"id": r.get("OBJECTID"), "date": d, "text": r.get("PROPOSAL")})
             
         is_t, s = classify(r)
-        if is_t and get_d(r) >= cutoff:
+        # If date is 0 but ID is very high, it's likely a brand new record not yet dated
+        if is_t and (d >= cutoff or d == 0):
             r["_score"] = s
-            r["_date"] = datetime.fromtimestamp(get_d(r)/1000, tz=timezone.utc).strftime("%Y-%m-%d")
+            r["_date"] = datetime.fromtimestamp(d/1000, tz=timezone.utc).strftime("%Y-%m-%d") if d > 0 else "Pending"
             leads.append(r)
             
     return {
         "council_count": len(recs),
         "debug_samples": samples,
         "leads_found": len(leads),
-        "leads": leads[:20]
+        "leads": leads[:30]
     }
 
 @app.get("/trigger-scrape")
@@ -87,15 +92,21 @@ def scrape(x_trigger_secret: str = Header(default=None)):
     if x_trigger_secret != T_SEC: raise HTTPException(status_code=401)
     recs = fetch()
     cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).timestamp() * 1000
-    found = [r for r in recs if get_d(r) >= cutoff and classify(r)[0]]
+    found = []
+    for r in recs:
+        d = get_d(r)
+        is_t, s = classify(r)
+        if is_t and (d >= cutoff or d == 0):
+            r["_score"] = s
+            found.append(r)
     if not found: return {"status": "no leads"}
-    found.sort(key=lambda x: classify(x)[1], reverse=True)
+    found.sort(key=lambda x: x["_score"], reverse=True)
     best = found[0]
     
     ai = client.chat.completions.create(
         model="gpt-4o-mini", response_format={"type": "json_object"},
         messages=[{"role": "system", "content": "Return JSON: applicant_name, site_address, postcode, scope_summary, high_value (bool)"},
-                  {"role": "user", "content": f"Addr: {best.get('ADDRESS')} Prop: {best.get('PROPOSAL') or best.get('DESCRIPT')}"}]
+                  {"role": "user", "content": f"Addr: {best.get('ADDRESS')} Prop: {best.get('PROPOSAL')}"}]
     )
     ld = json.loads(ai.choices[0].message.content)
     
