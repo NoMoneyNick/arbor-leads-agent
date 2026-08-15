@@ -207,4 +207,43 @@ def scrape(secret: str = Query(...)):
                     checkout = stripe.checkout.Session.create(
                         payment_method_types=["card"],
                         line_items=[{"price_data": {"currency": "gbp", "product_data": {"name": f"Lead: {ld.get('site_address')}"}, "unit_amount": amt}, "quantity": 1}],
-                        mode="payment", success_url=f"{P_URL}/payment-succ
+                        mode="payment", success_url=f"{P_URL}/payment-success", cancel_url=f"{P_URL}/payment-cancelled",
+                        metadata={"surgeon_id": str(sgn["id"]), "ref": ref, "site_address": ld.get("site_address")}
+                    )
+                    
+                    email_html = f"""
+                    <div style='font-family:sans-serif; border-left: 10px solid #1a73e8; padding:20px; background:#f9f9f9;'>
+                        <h2 style='color:#1a73e8;'>New Tree Lead: {c_name}</h2>
+                        <p><strong>Work:</strong> {ld.get('scope_summary')}</p>
+                        <p><strong>Location:</strong> {ld.get('site_address')}</p>
+                        <br/>
+                        <a href='{checkout.url}' style='background:#1a73e8; color:white; padding:15px 30px; text-decoration:none; border-radius:5px; font-weight:bold; display:inline-block;'>Buy Lead Details (£{amt/100})</a>
+                    </div>
+                    """
+                    requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [sgn["email"]], "subject": f"Lead: {ld.get('site_address')}", "html": email_html}, headers={"Authorization": f"Bearer {R_KEY}"})
+                
+                mark_as_sent(ref)
+                leads_sent += 1
+                if leads_sent >= 10: break
+        if leads_sent >= 10: break
+    return {"status": "success", "leads_sent": leads_sent}
+
+@app.post("/webhook", include_in_schema=False)
+async def webhook(req: Request):
+    sig, payload = req.headers.get("stripe-signature"), await req.body()
+    try:
+        event = stripe.Webhook.construct_event(payload, sig, S_WH)
+        if event["type"] == "checkout.session.completed":
+            sess = event["data"]["object"]
+            if sess["id"] not in _processed:
+                _processed.add(sess["id"])
+                m = sess["metadata"]
+                requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [T_EM], "subject": "💰 SALE!", "html": f"Paid: {m.get('site_address')}"}, headers={"Authorization": f"Bearer {R_KEY}"})
+    except: pass
+    return {"status": "ok"}
+
+@app.get("/payment-success", include_in_schema=False)
+def success(): return HTMLResponse("<h1>Success!</h1>")
+
+@app.get("/payment-cancelled", include_in_schema=False)
+def cancel(): return HTMLResponse("<h1>Cancelled</h1>")
