@@ -7,7 +7,7 @@ from openai import OpenAI
 # Disable SSL warnings for internal council certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="Vector Data Labs - V17.0 Master", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs - V17.1 Master", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
@@ -22,30 +22,25 @@ client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# --- THE MASTER LIST (V17.0 Verified Production Paths) ---
-# We are moving away from 'Discovery' and hitting the exact internal layer IDs.
+# --- THE MASTER LIST (V17.1 Verified Production Paths) ---
 COUNCILS = {
     "Leeds_Control": {
         "url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query",
         "referer": "https://www.leeds.gov.uk/"
     },
     "London_Mega_Hub": {
-        # This is the direct feed for the Planning London Datahub (GLA)
         "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_London_Datahub/FeatureServer/0/query",
         "referer": "https://www.london.gov.uk/"
     },
     "Richmond_Wandsworth": {
-        # Verified 2024 path for the shared borough cluster
         "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications/FeatureServer/0/query",
         "referer": "https://www.wandsworth.gov.uk/"
     },
     "Woking_Surrey": {
-        # Woking uses a specific 'Live' suffix in the new cycle
         "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications_Live/FeatureServer/0/query",
         "referer": "https://www.woking.gov.uk/"
     },
     "Croydon_Direct": {
-        # Croydon's direct MapServer is heavily protected; hitting it with the 'Mac Mask'
         "url": "https://maps.croydon.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
         "referer": "https://maps.croydon.gov.uk/planning/index.html"
     }
@@ -56,29 +51,25 @@ TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "st
 SKIP_WORDS = ["dwelling", "erection of", "new build", "extension", "loft conversion", "demolition"]
 
 def get_d(r):
-    # Extracts timestamp from various possible ArcGIS date fields
     v = r.get("DATE_RECEIVED") or r.get("DATE_VALID") or r.get("DATEAPVAL") or r.get("RECDAT") or 0
     try: return float(v)
     except: return 0
 
 def classify(r):
-    # Aggregated search for descriptions across different council schemas
     p = str(r.get("development_description") or r.get("PROPOSAL") or r.get("DESCRIPTION") or r.get("DESCRIPT") or "").lower()
     if not p: return False, 0
     matches = [k for k in TREE_WORDS if k in p]
     score = len(matches)
     if "tree" in p: score += 2
     if any(x in p for x in ["fell", "remove", "crown", "tpo", "conservation area"]): score += 5
-    # Strict filter: don't pick up house extensions that just mention a tree in passing
     if any(w in p for w in SKIP_WORDS) and score < 8: return False, 0
     return (score > 2), score
 
-# --- FETCHING LOGIC (The Mac Mask V17.0) ---
+# --- FETCHING LOGIC ---
 def fetch_council(name, config):
     url = config["url"]
-    # We are mimicking a full browser session to bypass Croydon/Richmond firewalls
     h = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-GB,en;q=0.9",
         "Referer": config["referer"],
@@ -89,11 +80,10 @@ def fetch_council(name, config):
         res = requests.get(url, params=q, headers=h, timeout=25, verify=False)
         if res.status_code != 200: return [], f"HTTP {res.status_code} Error"
         
-        # Check if the response is actually JSON (Firewall Check)
         try:
             data = res.json()
         except:
-            return [], "Firewall: Blocked (HTML response)"
+            return [], "Firewall Blocked (HTML Response)"
             
         if "error" in data: return [], f"ArcGIS: {data['error'].get('message', 'Unknown Error')}"
         
@@ -125,14 +115,16 @@ def mark_as_sent(ref):
 # --- ROUTES ---
 @app.get("/", response_class=HTMLResponse)
 def lander():
-    return f"<html><body style='font-family:sans-serif;text-align:center;padding-top:50px; background:#fafafa;'>
+    return f"""
+    <html><body style='font-family:sans-serif;text-align:center;padding-top:50px; background:#fafafa;'>
     <div style='display:inline-block; padding:40px; background:white; border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,0.05); border-top: 5px solid #1a73e8;'>
-    <h1>Vector Data Labs V17.0</h1>
+    <h1>Vector Data Labs V17.1</h1>
     <p>Leeds: <b>ACTIVE</b> | London: <b>PRODUCTION PUSH</b></p>
     <hr style='border:0; border-top:1px solid #eee; margin:20px 0;'/>
     <a href='/test-regional' style='color:#1a73e8; text-decoration:none; font-weight:bold;'>Run Master Health Check</a>
     </div>
-    </body></html>"
+    </body></html>
+    """
 
 @app.get("/test-regional")
 def test_all():
@@ -178,7 +170,6 @@ def scrape(secret: str = Query(...)):
                 if not surgeons: surgeons.append({"id": 1, "email": T_EM})
 
                 for sgn in surgeons:
-                    # London leads are higher value: £35 / £60
                     amt = 6000 if ld.get("high_value") else 3500
                     checkout = stripe.checkout.Session.create(
                         payment_method_types=["card"],
@@ -204,8 +195,8 @@ def scrape(secret: str = Query(...)):
         if leads_sent >= 10: break
     return {"status": "success", "leads_sent": leads_sent}
 
-@app.get("/payment-success")
+@app.get("/payment-success", include_in_schema=False)
 def success(): return HTMLResponse("<h1>Success!</h1>")
 
-@app.get("/payment-cancelled")
+@app.get("/payment-cancelled", include_in_schema=False)
 def cancel(): return HTMLResponse("<h1>Cancelled</h1>")
