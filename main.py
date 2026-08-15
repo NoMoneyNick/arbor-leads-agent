@@ -7,7 +7,7 @@ from openai import OpenAI
 # Silence SSL warnings for councils with internal/self-signed certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="Vector Data Labs - V9.7 London Standard", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs - V9.9 London Siege", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
@@ -22,48 +22,49 @@ client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# --- THE STABLE ENDPOINTS (V9.7) ---
-# Leeds stays as the ArcGIS control. 
-# London moves to the Official Datahub REST API.
+# --- THE SIEGE LIST (V9.9 Verified Cloud Paths) ---
+# We use 'services2.arcgis.com' which is the stable ESRI cloud host for most UK councils.
 COUNCILS = {
     "Leeds_Control": {
-        "type": "arcgis",
         "url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query",
         "referer": "https://www.leeds.gov.uk/"
     },
-    "London_Datahub": {
-        "type": "rest_api",
-        "url": "https://data.london.gov.uk/api/planning/v1/applications/",
-        "params": {"page_size": 50}
+    "London_Mega_Hub": {
+        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_London_Datahub/FeatureServer/0/query",
+        "referer": "https://www.london.gov.uk/"
+    },
+    "Croydon_Local": {
+        "url": "https://maps.croydon.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
+        "referer": "https://www.croydon.gov.uk/"
+    },
+    "Woking_Surrey": {
+        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications_Live/FeatureServer/0/query",
+        "referer": "https://www.woking.gov.uk/"
     }
 }
 
 # --- WEB PAGES ---
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def lander():
-    return f"<html><body style='font-family:sans-serif;text-align:center;'><h1>Vector Data Labs V9.7</h1><p>Leeds: ACTIVE | London: DATAHUB API</p><a href='/test-regional'>Run Health Check</a></body></html>"
+    return f"<html><body style='font-family:sans-serif;text-align:center;'><h1>Vector Data Labs V9.9</h1><p>Leeds: ACTIVE | London/Surrey: SIEGE</p><a href='/test-regional'>Run Health Check</a></body></html>"
 
 # --- CLASSIFICATION LOGIC (DNA PRESERVED) ---
 TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "stump", "arboriculture", "oak", "ash ", "cedar", "conifer", "birch", "maple", "willow", "sycamore"]
-SKIP_WORDS = ["dwelling", "erection of", "new build", "extension", "loft conversion", "basement"]
+SKIP_WORDS = ["dwelling", "erection of", "new build", "extension", "loft conversion"]
 
 def get_d(r):
-    # London Hub uses 'received_date', Leeds uses 'DATE_RECEIVED'
-    v = r.get("received_date") or r.get("DATE_RECEIVED") or r.get("DATE_VALID") or r.get("DATEAPVAL") or 0
-    # Convert string dates to timestamp if necessary
-    if isinstance(v, str):
-        try: return datetime.fromisoformat(v.replace('Z', '+00:00')).timestamp() * 1000
-        except: return 0
+    # Extracts timestamp from various possible ArcGIS date fields
+    v = r.get("DATE_RECEIVED") or r.get("DATE_VALID") or r.get("DATEAPVAL") or r.get("RECDAT") or 0
     try: return float(v)
     except: return 0
 
 def classify(r):
-    # Search description fields across both API types
+    # Aggregated search for descriptions across different council schemas
     p = str(
         r.get("development_description") or 
-        r.get("description") or
         r.get("PROPOSAL") or 
-        r.get("DESCRIPTION") or ""
+        r.get("DESCRIPTION") or 
+        r.get("DESCRIPT") or ""
     ).lower()
     
     if not p: return False, 0
@@ -74,40 +75,38 @@ def classify(r):
     if "tree" in p: score += 2
     if any(x in p for x in ["fell", "remove", "crown", "tpo", "conservation area"]): score += 5
     
-    # Strict filtering: No house extensions
+    # Strict filtering: No house extensions unless it's a major tree job
     if any(w in p for w in SKIP_WORDS) and score < 8: return False, 0
     
     return (score > 2), score
 
-# --- FETCHING LOGIC (SUPPORTING BOTH API TYPES) ---
-def fetch_data(name, config):
+# --- FETCHING LOGIC (DNA PRESERVED) ---
+def fetch_council(name, config):
+    url = config["url"]
     h = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Referer": config["referer"],
         "Accept": "application/json"
     }
-    
-    if config["type"] == "arcgis":
-        h["Referer"] = config["referer"]
-        q = {"where": "1=1", "outFields": "*", "resultRecordCount": 100, "orderByFields": "OBJECTID DESC", "f": "json"}
-        try:
-            res = requests.get(config["url"], params=q, headers=h, timeout=20, verify=False)
-            data = res.json()
-            if "error" in data: return [], f"ArcGIS Error: {data['error'].get('message')}"
-            return [f.get("attributes", {}) for f in data.get("features", [])], "Success"
-        except Exception as e:
-            return [], f"ArcGIS Fail: {str(e)}"
-            
-    elif config["type"] == "rest_api":
-        try:
-            res = requests.get(config["url"], params=config["params"], headers=h, timeout=20)
-            if res.status_code != 200: return [], f"API Error {res.status_code}"
-            # The GLA Hub returns data in a 'results' list
-            data = res.json()
-            return data.get("results", []), "Success"
-        except Exception as e:
-            return [], f"API Fail: {str(e)}"
-            
-    return [], "Unknown Config Type"
+    q = {
+        "where": "1=1", 
+        "outFields": "*", 
+        "resultRecordCount": 100, 
+        "orderByFields": "OBJECTID DESC", 
+        "f": "json"
+    }
+    try:
+        # verify=False is critical for London borough servers
+        res = requests.get(url, params=q, headers=h, timeout=20, verify=False)
+        if res.status_code != 200:
+            return [], f"HTTP {res.status_code} Error"
+        data = res.json()
+        if "error" in data:
+            return [], f"ArcGIS Error: {data['error'].get('message')}"
+        features = data.get("features", [])
+        return [f.get("attributes", {}) for f in features], "Success"
+    except Exception as e:
+        return [], f"Connection Fail: {str(e)}"
 
 # --- DATABASE (DNA PRESERVED) ---
 def is_already_sent(ref):
@@ -134,7 +133,7 @@ def mark_as_sent(ref):
 def test_all():
     results = {}
     for name, config in COUNCILS.items():
-        recs, status = fetch_data(name, config)
+        recs, status = fetch_council(name, config)
         found = [r for r in recs if classify(r)[0]]
         results[name] = {
             "status": status, 
@@ -148,15 +147,14 @@ def scrape(secret: str = Query(...)):
     if secret != T_SEC: raise HTTPException(status_code=401)
     leads_sent = 0
     for c_name, config in COUNCILS.items():
-        recs, _ = fetch_data(c_name, config)
+        recs, _ = fetch_council(c_name, config)
         cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).timestamp() * 1000
         for r in recs:
-            # Handle references for both API types
-            ref = r.get("external_system_reference") or r.get("reference") or r.get("REFVAL") or str(r.get("OBJECTID"))
+            ref = r.get("REFERENCE") or r.get("PLANNO") or r.get("REFVAL") or str(r.get("OBJECTID"))
             is_tree, _ = classify(r)
             if is_tree and (get_d(r) >= cutoff or get_d(r) == 0) and not is_already_sent(ref):
-                addr = r.get('full_address') or r.get('ADDRESS') or r.get('LOCATION')
-                prop = r.get('development_description') or r.get('description') or r.get('PROPOSAL')
+                addr = r.get('full_address') or r.get('ADDRESS') or r.get('LOCATION') or r.get('SITE_ADDRESS')
+                prop = r.get('development_description') or r.get('PROPOSAL') or r.get('DESCRIPTION')
                 try:
                     ai = client.chat.completions.create(
                         model="gpt-4o-mini", response_format={"type": "json_object"},
