@@ -7,11 +7,11 @@ from openai import OpenAI
 # Silence SSL warnings for councils with internal/self-signed certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="Vector Data Labs - V10.0 Master", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs - V12.0 Master", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
-# --- ENVIRONMENT (DNA PRESERVED) ---
+# --- ENVIRONMENT ---
 OKEY, SURL = os.getenv("OPENAI_API_KEY"), os.getenv("SUPABASE_DB_URL")
 S_SEC, S_WH = os.getenv("STRIPE_SECRET_KEY"), os.getenv("STRIPE_WEBHOOK_SECRET")
 R_KEY, T_EM = os.getenv("RESEND_API_KEY"), os.getenv("TEST_EMAIL")
@@ -22,26 +22,29 @@ client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# --- THE MASTER LIST (V10.0 Verified Production Paths) ---
-# We are targeting the specific FeatureServer layers that drive their public maps.
+# --- THE MASTER LIST (V12.0 Stealth & Path Recovery) ---
 COUNCILS = {
     "Leeds_Control": {
         "url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query",
         "referer": "https://www.leeds.gov.uk/"
     },
     "London_Mega_Hub": {
+        # Using the standard "Planning_London_Datahub" path
         "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_London_Datahub/FeatureServer/0/query",
         "referer": "https://www.london.gov.uk/"
     },
     "Woking_Surrey": {
-        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications_Live/FeatureServer/0/query",
+        # Woking uses the same 'S96p' hub as London but a different service name
+        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications_Woking/FeatureServer/0/query",
         "referer": "https://www.woking.gov.uk/"
     },
     "Hillingdon_London": {
-        "url": "https://hillingdon.gov.uk/arcgis/rest/services/planning_local_plan_data_17/FeatureServer/0/query",
+        # New direct endpoint discovered in Hillingdon PublicServices folder
+        "url": "https://maps.hillingdon.gov.uk/arcgis/rest/services/PublicServices/Planning_Applications/MapServer/0/query",
         "referer": "https://www.hillingdon.gov.uk/"
     },
     "Croydon_Direct": {
+        # Croydon adds a firewall; we hit their MapServer but with improved headers
         "url": "https://maps.croydon.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
         "referer": "https://www.croydon.gov.uk/"
     }
@@ -54,8 +57,8 @@ def lander():
     <html>
         <body style='font-family:sans-serif; text-align:center; padding-top:50px; background:#fafafa;'>
             <div style='display:inline-block; padding:40px; background:white; border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,0.05);'>
-                <h1 style='color:#1a73e8;'>Vector Data Labs V10.0</h1>
-                <p>System Online | Leeds <b>ACTIVE</b> | London <b>SIEGE</b></p>
+                <h1 style='color:#1a73e8;'>Vector Data Labs V12.0</h1>
+                <p>Status: <b> Leeds Master </b> Active</p>
                 <hr style='border:0; border-top:1px solid #eee; margin:20px 0;'/>
                 <a href='/test-regional' style='color:#1a73e8; text-decoration:none; font-weight:bold;'>Run Regional Health Check</a>
             </div>
@@ -68,13 +71,11 @@ TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "st
 SKIP_WORDS = ["dwelling", "erection of", "new build", "extension", "loft conversion", "demolition"]
 
 def get_d(r):
-    # Extracts timestamp from various possible ArcGIS date fields
     v = r.get("DATE_RECEIVED") or r.get("DATE_VALID") or r.get("DATEAPVAL") or r.get("RECDAT") or r.get("actual_decision_date") or 0
     try: return float(v)
     except: return 0
 
 def classify(r):
-    # Aggregated search for descriptions across different council schemas
     p = str(
         r.get("development_description") or 
         r.get("PROPOSAL") or 
@@ -90,19 +91,21 @@ def classify(r):
     
     if "tree" in p: score += 2
     if any(x in p for x in ["fell", "remove", "crown", "tpo", "conservation area"]): score += 5
-    
-    # Strict filtering: No house extensions unless it's a major tree job
     if any(w in p for w in SKIP_WORDS) and score < 8: return False, 0
     
     return (score > 2), score
 
-# --- FETCHING LOGIC ---
+# --- FETCHING LOGIC (Leeds BP + Stealth) ---
 def fetch_council(name, config):
     url = config["url"]
+    # Enhanced Headers to mimic a real Mac Browser
     h = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Referer": config["referer"],
-        "Accept": "application/json"
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-GB,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive"
     }
     q = {
         "where": "1=1", 
@@ -112,23 +115,23 @@ def fetch_council(name, config):
         "f": "json"
     }
     try:
-        res = requests.get(url, params=q, headers=h, timeout=20, verify=False)
+        res = requests.get(url, params=q, headers=h, timeout=25, verify=False)
+        
+        # Check if we were blocked by a firewall
+        if "<html>" in res.text.lower():
+            return [], "HTML Firewall Blocked (WAF)"
+        
         if res.status_code != 200:
             return [], f"HTTP {res.status_code} Error"
         
-        # Check if response is actually JSON
-        try:
-            data = res.json()
-        except:
-            return [], "HTML Error Page (Firewall)"
-
+        data = res.json()
         if "error" in data:
-            return [], f"ArcGIS Error: {data['error'].get('message')}"
+            return [], f"ArcGIS: {data['error'].get('message')}"
             
         features = data.get("features", [])
         return [f.get("attributes", {}) for f in features], "Success"
     except Exception as e:
-        return [], f"Connection Fail: {str(e)}"
+        return [], f"Fail: {str(e)}"
 
 # --- DATABASE ---
 def is_already_sent(ref):
@@ -172,7 +175,7 @@ def scrape(secret: str = Query(...)):
         recs, _ = fetch_council(c_name, config)
         cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).timestamp() * 1000
         for r in recs:
-            ref = r.get("REFERENCE") or r.get("PLANNO") or r.get("REFVAL") or str(r.get("OBJECTID"))
+            ref = str(r.get("REFERENCE") or r.get("PLANNO") or r.get("REFVAL") or r.get("OBJECTID"))
             is_tree, _ = classify(r)
             if is_tree and (get_d(r) >= cutoff or get_d(r) == 0) and not is_already_sent(ref):
                 addr = r.get('full_address') or r.get('ADDRESS') or r.get('LOCATION') or r.get('SITE_ADDRESS')
@@ -200,48 +203,8 @@ def scrape(secret: str = Query(...)):
                 if not surgeons: surgeons.append({"id": 1, "email": T_EM})
 
                 for sgn in surgeons:
-                    # London Pricing: £35 / £60
                     amt = 6000 if ld.get("high_value") else 3500
                     checkout = stripe.checkout.Session.create(
                         payment_method_types=["card"],
                         line_items=[{"price_data": {"currency": "gbp", "product_data": {"name": f"Lead: {ld.get('site_address')}"}, "unit_amount": amt}, "quantity": 1}],
-                        mode="payment", success_url=f"{P_URL}/payment-success", cancel_url=f"{P_URL}/payment-cancelled",
-                        metadata={"surgeon_id": str(sgn["id"]), "ref": ref, "site_address": ld.get("site_address")}
-                    )
-                    
-                    email_html = f"""
-                    <div style='font-family:sans-serif; border-left: 10px solid #1a73e8; padding:20px; background:#f9f9f9;'>
-                        <h2 style='color:#1a73e8;'>New Tree Lead: {c_name}</h2>
-                        <p><strong>Work:</strong> {ld.get('scope_summary')}</p>
-                        <p><strong>Location:</strong> {ld.get('site_address')}</p>
-                        <br/>
-                        <a href='{checkout.url}' style='background:#1a73e8; color:white; padding:15px 30px; text-decoration:none; border-radius:5px; font-weight:bold; display:inline-block;'>Buy Lead Details (£{amt/100})</a>
-                    </div>
-                    """
-                    requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [sgn["email"]], "subject": f"Lead: {ld.get('site_address')}", "html": email_html}, headers={"Authorization": f"Bearer {R_KEY}"})
-                
-                mark_as_sent(ref)
-                leads_sent += 1
-                if leads_sent >= 10: break
-        if leads_sent >= 10: break
-    return {"status": "success", "leads_sent": leads_sent}
-
-@app.post("/webhook", include_in_schema=False)
-async def webhook(req: Request):
-    sig, payload = req.headers.get("stripe-signature"), await req.body()
-    try:
-        event = stripe.Webhook.construct_event(payload, sig, S_WH)
-        if event["type"] == "checkout.session.completed":
-            sess = event["data"]["object"]
-            if sess["id"] not in _processed:
-                _processed.add(sess["id"])
-                m = sess["metadata"]
-                requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [T_EM], "subject": "💰 SALE!", "html": f"Paid: {m.get('site_address')}"}, headers={"Authorization": f"Bearer {R_KEY}"})
-    except: pass
-    return {"status": "ok"}
-
-@app.get("/payment-success", include_in_schema=False)
-def success(): return HTMLResponse("<h1>Success!</h1>")
-
-@app.get("/payment-cancelled", include_in_schema=False)
-def cancel(): return HTMLResponse("<h1>Cancelled</h1>")
+                        mode="payment", success_url=f"{P_URL}/payment-succ
