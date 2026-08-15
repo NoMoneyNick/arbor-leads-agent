@@ -4,10 +4,10 @@ from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from openai import OpenAI
 
-# Disable SSL warnings for internal council certificates
+# Disable SSL warnings for internal council certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="Vector Data Labs - V24.0 Master Breakthrough", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs - V25.0 Master Breakthrough", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
@@ -22,115 +22,102 @@ client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# --- THE MASTER DATA ARCHITECTURE (V24.0 Verified Paths) ---
-# We hit the raw FeatureServer clusters directly, mimicking official map viewer traffic.
+# --- THE MASTER DATA ARCHITECTURE (V25.0 Self-Healing) ---
+# We provide a base cluster and a list of path variations to try automatically.
 COUNCILS = {
     "Leeds_Baseline": {
+        "type": "direct",
         "url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query",
         "referer": "https://www.leeds.gov.uk/"
     },
     "London_Mega_Hub": {
-        # This is the physical data hub for the GLA. It aggregates 32 boroughs.
-        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_London_Datahub/FeatureServer/0/query",
+        "type": "failover",
+        "cluster": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services",
+        "paths": ["Planning_London_Datahub", "Planning_Applications", "GLA_Planning_Live"],
         "referer": "https://www.london.gov.uk/"
     },
     "Woking_Surrey": {
-        # Direct cloud path for the Surrey cluster
-        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications_Woking/FeatureServer/0/query",
+        "type": "failover",
+        "cluster": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services",
+        "paths": ["Planning_Applications_Woking", "Woking_Planning", "Planning"],
         "referer": "https://www.woking.gov.uk/"
     },
     "Croydon_Direct": {
-        # Croydon-specific MapServer with enhanced residential headers
+        "type": "handshake",
         "url": "https://maps.croydon.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
+        "home": "https://www.croydon.gov.uk/planning-and-regeneration",
         "referer": "https://maps.croydon.gov.uk/planning/index.html"
     }
 }
 
 # --- LOGIC: CLASSIFICATION ---
-TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "stump", "arboriculture", "oak", "ash", "cedar", "conifer", "birch", "maple", "willow", "sycamore", "conservation area"]
+TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "stump", "arboriculture", "oak", "ash", "cedar", "conifer", "birch", "maple", "willow", "sycamore", "poplar"]
 SKIP_WORDS = ["dwelling", "erection of", "new build", "extension", "loft conversion", "demolition"]
 
 def get_d(r):
-    # Handles ISO strings (London), millisecond timestamps (Leeds), and integers (Surrey)
     v = r.get("received_date") or r.get("DATE_RECEIVED") or r.get("DATE_VALID") or r.get("DATEAPVAL") or r.get("RECDAT") or 0
     if isinstance(v, str):
-        try:
-            # Handle standard ISO and Z suffixes
-            clean_v = v.replace('Z', '+00:00')
-            return datetime.fromisoformat(clean_v).timestamp() * 1000
+        try: return datetime.fromisoformat(v.replace('Z', '+00:00')).timestamp() * 1000
         except: return 0
     return float(v)
 
 def classify(r):
-    # Comprehensive field mapping across all UK council schemas
-    p = str(
-        r.get("development_description") or 
-        r.get("PROPOSAL") or 
-        r.get("DESCRIPTION") or 
-        r.get("DESCRIPT") or 
-        r.get("DETDESC") or ""
-    ).lower()
-    
+    p = str(r.get("development_description") or r.get("PROPOSAL") or r.get("DESCRIPTION") or r.get("DESCRIPT") or "").lower()
     if not p: return False, 0
-    
     matches = [k for k in TREE_WORDS if k in p]
     score = len(matches)
-    
     if "tree" in p: score += 2
-    if any(x in p for x in ["fell", "remove", "crown", "tpo", "ash dieback"]): score += 5
-    
-    # Negative filtering for major construction
+    if any(x in p for x in ["fell", "remove", "crown", "tpo"]): score += 5
     if any(w in p for w in SKIP_WORDS) and score < 8: return False, 0
     return (score > 2), score
 
-# --- THE DATA RETRIEVAL ENGINE (V24.0) ---
+# --- THE DATA RETRIEVAL ENGINE (V25.0) ---
 def fetch_council(name, config):
     session = requests.Session()
-    # The 'Business-Level' Header Stack:
-    # Adding X-Requested-With and specialized browser Client Hints
     h = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-GB,en;q=0.9",
         "Referer": config["referer"],
         "X-Requested-With": "XMLHttpRequest",
-        "Sec-Ch-Ua": '"Not)A;Brand";v="99", "Google Chrome";v="127", "Chromium";v="127"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"macOS"',
         "Connection": "keep-alive"
     }
-    
-    # Standard ArcGIS query parameters
-    q = {
-        "where": "1=1",
-        "outFields": "*",
-        "resultRecordCount": 100,
-        "orderByFields": "OBJECTID DESC",
-        "f": "json"
-    }
-    
-    try:
-        time.sleep(1) # Polite pause to avoid rate-limit flagging
-        res = session.get(config["url"], params=q, headers=h, timeout=30, verify=False)
-        
-        if res.status_code != 200:
-            return [], f"Error: HTTP {res.status_code}"
-            
-        if "html" in res.text.lower():
-            return [], "Firewall Blocked (HTML Response)"
-            
-        data = res.json()
-        if "error" in data:
-            return [], f"ArcGIS Error: {data['error'].get('message', 'Unknown')}"
-            
-        # Extract records from FeatureServer/MapServer standard response
-        features = data.get("features", [])
-        return [f.get("attributes", {}) for f in features], "Online"
-        
-    except Exception as e:
-        return [], f"Fault: {str(e)}"
+    q = {"where": "1=1", "outFields": "*", "resultRecordCount": 50, "orderByFields": "OBJECTID DESC", "f": "json"}
 
-# --- DATABASE OPERATIONS ---
+    # Track 1: Static Direct (Leeds)
+    if config["type"] == "direct":
+        try:
+            res = session.get(config["url"], params=q, headers=h, timeout=20, verify=False)
+            if res.status_code == 200:
+                return [f.get("attributes", {}) for f in res.json().get("features", [])], "Success"
+        except: pass
+
+    # Track 2: Handshake (Croydon)
+    if config["type"] == "handshake":
+        try:
+            session.get(config["home"], headers=h, timeout=15, verify=False) # Visit home first
+            res = session.get(config["url"], params=q, headers=h, timeout=15, verify=False)
+            if "html" in res.text.lower(): return [], "Firewall Blocked"
+            return [f.get("attributes", {}) for f in res.json().get("features", [])], "Success"
+        except: pass
+
+    # Track 3: Failover Probing (London/Woking)
+    if config["type"] == "failover":
+        for path in config["paths"]:
+            for s_type in ["FeatureServer", "MapServer"]:
+                # Try common UK indices: 0 (Direct) and 5 (Surrey Standard)
+                for layer_id in [0, 5]:
+                    probe_url = f"{config['cluster']}/{path}/{s_type}/{layer_id}/query"
+                    try:
+                        res = session.get(probe_url, params=q, headers=h, timeout=12, verify=False)
+                        if res.status_code == 200 and "features" in res.text:
+                            data = res.json()
+                            if len(data.get("features", [])) > 0:
+                                return [f.get("attributes", {}) for f in data.get("features", [])], f"Success ({path} L{layer_id})"
+                    except: continue
+                    
+    return [], "Offline/Rotated"
+
+# --- DATABASE & ROUTES ---
 def is_already_sent(ref):
     if not SURL: return False
     try:
@@ -150,16 +137,15 @@ def mark_as_sent(ref):
         conn.commit(); conn.close()
     except: pass
 
-# --- ROUTES ---
 @app.get("/", response_class=HTMLResponse)
 def lander():
     return f"""
-    <html><body style='font-family:sans-serif; text-align:center; padding-top:50px; background:#f4f4f9;'>
+    <html><body style='font-family:sans-serif; text-align:center; padding-top:50px; background:#fafafa;'>
     <div style='display:inline-block; padding:40px; background:white; border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,0.05); border-top: 5px solid #2e7d32;'>
-    <h1>Vector Data Labs V24.0</h1>
-    <p>Leeds Baseline: <b>ACTIVE</b> | London Hub: <b>DIRECT CONNECTION</b></p>
+    <h1>Vector Data Labs V25.0</h1>
+    <p>Leeds Baseline: <b>ACTIVE</b> | Discovery Engine: <b>SELF-HEALING</b></p>
     <hr style='border:0; border-top:1px solid #eee; margin:20px 0;'/>
-    <a href='/test-regional' style='color:#2e7d32; text-decoration:none; font-weight:bold;'>Run Master Diagnostic</a>
+    <a href='/test-regional' style='color:#2e7d32; text-decoration:none; font-weight:bold;'>Run Full System Diagnostic</a>
     </div>
     </body></html>
     """
@@ -178,30 +164,22 @@ def scrape(secret: str = Query(...)):
     if secret != T_SEC: raise HTTPException(status_code=401)
     leads_sent = 0
     cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).timestamp() * 1000
-    
     for c_name, config in COUNCILS.items():
         recs, _ = fetch_council(c_name, config)
         for r in recs:
-            # Multi-API Reference Generator
-            ref = str(r.get("external_system_reference") or r.get("REFERENCE") or r.get("PLANNO") or r.get("OBJECTID"))
+            ref = str(r.get("external_system_reference") or r.get("REFERENCE") or r.get("OBJECTID"))
             is_valid, _ = classify(r)
-            
             if is_valid and (get_d(r) >= cutoff or get_d(r) == 0) and not is_already_sent(ref):
                 addr = r.get('full_address') or r.get('ADDRESS') or r.get('LOCATION') or r.get('SITE_ADDRESS')
                 prop = r.get('development_description') or r.get('PROPOSAL') or r.get('DESCRIPTION')
-                
                 try:
                     ai = client.chat.completions.create(
-                        model="gpt-4o-mini", 
-                        response_format={"type": "json_object"},
-                        messages=[
-                            {"role": "system", "content": "Return JSON: applicant_name, site_address, postcode, scope_summary, high_value (bool)."},
-                            {"role": "user", "content": f"Addr: {addr} Prop: {prop}"}
-                        ]
+                        model="gpt-4o-mini", response_format={"type": "json_object"},
+                        messages=[{"role": "system", "content": "Return JSON: applicant_name, site_address, postcode, scope_summary, high_value (bool)."},
+                        {"role": "user", "content": f"Addr: {addr} Prop: {prop}"}]
                     )
                     ld = json.loads(ai.choices[0].message.content)
                 except: continue
-
                 surgeons = [{"id": 1, "email": T_EM}]
                 if SURL:
                     try:
@@ -210,19 +188,17 @@ def scrape(secret: str = Query(...)):
                         surgeons = [{"id": row[0], "email": row[1]} for row in c.fetchall()] or surgeons
                         db.close()
                     except: pass
-
                 for sgn in surgeons:
-                    # London pricing for high-value leads: £35 / £60
                     amt = 6000 if ld.get("high_value") else 3500
                     checkout = stripe.checkout.Session.create(
                         payment_method_types=["card"],
                         line_items=[{"price_data": {"currency": "gbp", "product_data": {"name": f"Lead: {ld.get('site_address')}"}, "unit_amount": amt}, "quantity": 1}],
-                        mode="payment", success_url=f"{P_URL}/payment-success", cancel_url=f"{P_URL}/payment-cancelled",
+                        mode="payment", success_url=f"{P_URL}/payment-success",
+                        cancel_url=f"{P_URL}/payment-cancelled",
                         metadata={"surgeon_id": str(sgn["id"]), "ref": ref, "site_address": ld.get("site_address")}
                     )
                     email_html = f"<h2>New Lead: {c_name}</h2><p>{ld.get('scope_summary')}</p><a href='{checkout.url}'>Purchase Lead</a>"
                     requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [sgn["email"]], "subject": f"Lead: {ld.get('site_address')}", "html": email_html}, headers={"Authorization": f"Bearer {R_KEY}"})
-                
                 mark_as_sent(ref)
                 leads_sent += 1
                 if leads_sent >= 10: break
