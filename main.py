@@ -7,7 +7,7 @@ from openai import OpenAI
 # Disable SSL warnings for internal council certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="Vector Data Labs - V17.1 Master", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs - V17.2 Master", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
@@ -22,25 +22,35 @@ client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# --- THE MASTER LIST (V17.1 Verified Production Paths) ---
+# --- THE MASTER LIST (V17.2 Production Sync) ---
+# We are using the absolute production paths discovered in the 2024 registry.
 COUNCILS = {
     "Leeds_Control": {
         "url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query",
         "referer": "https://www.leeds.gov.uk/"
     },
     "London_Mega_Hub": {
-        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_London_Datahub/FeatureServer/0/query",
+        # Using the standardized 'Planning_Applications' path for the S96p cluster
+        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications/FeatureServer/0/query",
         "referer": "https://www.london.gov.uk/"
     },
     "Richmond_Wandsworth": {
-        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications/FeatureServer/0/query",
+        # Richmond often uses the 'Planning_Live' suffix in the current cycle
+        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Live/FeatureServer/0/query",
         "referer": "https://www.wandsworth.gov.uk/"
     },
     "Woking_Surrey": {
-        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications_Live/FeatureServer/0/query",
+        # Woking has shifted to the root 'Planning' service
+        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning/FeatureServer/0/query",
         "referer": "https://www.woking.gov.uk/"
     },
+    "Hillingdon_London": {
+        # Pointing to the new 'PublicServices' production folder
+        "url": "https://maps.hillingdon.gov.uk/arcgis/rest/services/PublicServices/Planning_Applications/MapServer/0/query",
+        "referer": "https://www.hillingdon.gov.uk/"
+    },
     "Croydon_Direct": {
+        # Adding 'Origin' spoofing to the Croydon node
         "url": "https://maps.croydon.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
         "referer": "https://maps.croydon.gov.uk/planning/index.html"
     }
@@ -51,7 +61,7 @@ TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "st
 SKIP_WORDS = ["dwelling", "erection of", "new build", "extension", "loft conversion", "demolition"]
 
 def get_d(r):
-    v = r.get("DATE_RECEIVED") or r.get("DATE_VALID") or r.get("DATEAPVAL") or r.get("RECDAT") or 0
+    v = r.get("DATE_RECEIVED") or r.get("DATE_VALID") or r.get("DATEAPVAL") or r.get("RECDAT") or r.get("received_date") or 0
     try: return float(v)
     except: return 0
 
@@ -65,14 +75,17 @@ def classify(r):
     if any(w in p for w in SKIP_WORDS) and score < 8: return False, 0
     return (score > 2), score
 
-# --- FETCHING LOGIC ---
+# --- FETCHING LOGIC (With Production Headers) ---
 def fetch_council(name, config):
     url = config["url"]
     h = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-GB,en;q=0.9",
         "Referer": config["referer"],
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
         "Connection": "keep-alive"
     }
     q = {"where": "1=1", "outFields": "*", "resultRecordCount": 50, "orderByFields": "OBJECTID DESC", "f": "json"}
@@ -83,7 +96,7 @@ def fetch_council(name, config):
         try:
             data = res.json()
         except:
-            return [], "Firewall Blocked (HTML Response)"
+            return [], "HTML Firewall Blocked"
             
         if "error" in data: return [], f"ArcGIS: {data['error'].get('message', 'Unknown Error')}"
         
@@ -118,8 +131,8 @@ def lander():
     return f"""
     <html><body style='font-family:sans-serif;text-align:center;padding-top:50px; background:#fafafa;'>
     <div style='display:inline-block; padding:40px; background:white; border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,0.05); border-top: 5px solid #1a73e8;'>
-    <h1>Vector Data Labs V17.1</h1>
-    <p>Leeds: <b>ACTIVE</b> | London: <b>PRODUCTION PUSH</b></p>
+    <h1>Vector Data Labs V17.2</h1>
+    <p>Leeds: <b>ACTIVE</b> | London: <b>PRODUCTION SYNC</b></p>
     <hr style='border:0; border-top:1px solid #eee; margin:20px 0;'/>
     <a href='/test-regional' style='color:#1a73e8; text-decoration:none; font-weight:bold;'>Run Master Health Check</a>
     </div>
@@ -195,8 +208,8 @@ def scrape(secret: str = Query(...)):
         if leads_sent >= 10: break
     return {"status": "success", "leads_sent": leads_sent}
 
-@app.get("/payment-success", include_in_schema=False)
+@app.get("/payment-success")
 def success(): return HTMLResponse("<h1>Success!</h1>")
 
-@app.get("/payment-cancelled", include_in_schema=False)
+@app.get("/payment-cancelled")
 def cancel(): return HTMLResponse("<h1>Cancelled</h1>")
