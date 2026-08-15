@@ -7,7 +7,7 @@ from openai import OpenAI
 # Disable SSL warnings for councils using internal/self-signed certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="Vector Data Labs - V14.1 Master", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs - V14.2 Master", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
@@ -22,7 +22,7 @@ client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# --- THE MASTER LIST (V14.1 Verified Paths) ---
+# --- THE MASTER LIST (V14.2 Infrastructure Fix) ---
 COUNCILS = {
     "Leeds_Control": {
         "type": "arcgis",
@@ -31,13 +31,25 @@ COUNCILS = {
     },
     "London_Datahub": {
         "type": "rest_api",
-        "url": "https://planning.data.london.gov.uk/api/v1/applications/",
+        # Reverting to the verified API root (fixing the DNS NameResolutionError)
+        "url": "https://data.london.gov.uk/api/planning/v1/applications/",
         "params": {"page_size": 50}
     },
     "Woking_Surrey": {
         "type": "arcgis",
-        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications/FeatureServer/0/query",
+        # Correcting the service name to the current 'Live' production path
+        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications_Live/FeatureServer/0/query",
         "referer": "https://www.woking.gov.uk/"
+    },
+    "Hillingdon_London": {
+        "type": "arcgis",
+        "url": "https://maps.hillingdon.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
+        "referer": "https://www.hillingdon.gov.uk/"
+    },
+    "Croydon_Direct": {
+        "type": "arcgis",
+        "url": "https://maps.croydon.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
+        "referer": "https://www.croydon.gov.uk/"
     }
 }
 
@@ -63,24 +75,27 @@ def classify(r):
     if any(w in p for w in SKIP_WORDS) and score < 8: return False, 0
     return (score > 2), score
 
-# --- FETCHING LOGIC (Multi-System Support) ---
+# --- FETCHING LOGIC (With JSON Fail-Safe) ---
 def fetch_council(name, config):
     h = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "application/json"
+        "Accept": "application/json",
+        "Referer": config.get("referer", "https://www.google.com")
     }
     try:
         if config["type"] == "arcgis":
-            h["Referer"] = config["referer"]
             q = {"where": "1=1", "outFields": "*", "resultRecordCount": 50, "orderByFields": "OBJECTID DESC", "f": "json"}
-            res = requests.get(config["url"], params=q, headers=h, timeout=20, verify=False)
+            res = requests.get(config["url"], params=q, headers=h, timeout=25, verify=False)
         else:
-            res = requests.get(config["url"], params=config["params"], headers=h, timeout=20)
+            res = requests.get(config["url"], params=config.get("params", {}), headers=h, timeout=25)
 
         if res.status_code != 200: return [], f"HTTP {res.status_code} Error"
-        if "<html>" in res.text.lower(): return [], "Firewall Block (HTML)"
         
-        data = res.json()
+        try:
+            data = res.json()
+        except:
+            return [], "Server returned HTML/Text instead of JSON"
+            
         if "error" in data: return [], f"ArcGIS: {data['error'].get('message')}"
         
         if config["type"] == "arcgis":
@@ -113,7 +128,7 @@ def mark_as_sent(ref):
 # --- ROUTES ---
 @app.get("/", response_class=HTMLResponse)
 def lander():
-    return f"<html><body style='font-family:sans-serif;text-align:center;'><h1>Vector Data Labs V14.1</h1><p>Leeds: ACTIVE | London: STABILIZING</p><a href='/test-regional'>Diagnostics</a></body></html>"
+    return f"<html><body style='font-family:sans-serif;text-align:center;'><h1>Vector Data Labs V14.2</h1><p>Leeds: ACTIVE | London/Surrey Fix in Progress</p><a href='/test-regional'>Diagnostics</a></body></html>"
 
 @app.get("/test-regional")
 def test_all():
