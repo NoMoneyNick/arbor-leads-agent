@@ -4,13 +4,14 @@ from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from openai import OpenAI
 
-# Professional Stability Setup
+# Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-app = FastAPI(title="Vector Data Labs - V30.0 Verified Master", docs_url="/docs")
+
+app = FastAPI(title="Vector Data Labs - V32.0 Tiered Master", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
-# --- ENVIRONMENT ---
+# --- ENVIRONMENT VARIABLES ---
 OKEY, SURL = os.getenv("OPENAI_API_KEY"), os.getenv("SUPABASE_DB_URL")
 S_SEC, S_WH = os.getenv("STRIPE_SECRET_KEY"), os.getenv("STRIPE_WEBHOOK_SECRET")
 R_KEY, T_EM = os.getenv("RESEND_API_KEY"), os.getenv("TEST_EMAIL")
@@ -21,62 +22,82 @@ client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# --- THE MASTER DATA ARCHITECTURE (V30.0 Verified) ---
+# --- THE MASTER DATA ARCHITECTURE (V32.0 Borough Side-Doors) ---
 COUNCILS = {
-    "Leeds_Control": {
+    "Leeds_Baseline": {
         "type": "arcgis",
         "url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query",
         "referer": "https://www.leeds.gov.uk/"
     },
-    "London_Official_Hub": {
+    "London_Official_API": {
         "type": "rest_api",
-        # The Primary 'Front Door' for the entire capital
-        "url": "https://planning.data.london.gov.uk/api/v1/applications/",
+        # Using the stable root host to fix the DNS resolution error
+        "url": "https://data.london.gov.uk/api/planning/v1/applications/",
         "params": {"page_size": 100}
     },
-    "London_Backup_Hub": {
+    "Southwark_Side_Door": {
         "type": "arcgis",
-        # A 'Side Door' hub that often bypasses the main API firewall
-        "url": "https://gis2.london.gov.uk/server/rest/services/apps/planning_data_map_02/MapServer/0/query",
-        "referer": "https://www.london.gov.uk/"
+        # Hitting a direct high-volume borough instead of the hub
+        "url": "https://geo.southwark.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
+        "referer": "https://www.southwark.gov.uk/"
     },
-    "Surrey_Cluster": {
+    "Croydon_Side_Door": {
         "type": "arcgis",
-        # The physical S96p server hosting Woking and surrounding councils
-        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications/FeatureServer/0/query",
-        "referer": "https://www.woking.gov.uk/"
+        # Direct local borough building
+        "url": "https://maps.croydon.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
+        "referer": "https://www.croydon.gov.uk/"
     }
 }
 
-# --- LOGIC: THE WIDE NET ---
-# Using your logic to find the cabinet first, then the files.
-HEADER_KEYWORDS = ["proposal", "description", "nature", "work", "natureofwork", "details", "devdesc", "development_description"]
-TREE_SPECIFIC = ["tree", "tpo", "fell", "crown", "pruning", "oak", "ash", "sycamore", "cedar", "birch", "willow"]
+# --- TIERED SEARCH LOGIC (Human Logic Applied) ---
+
+# TIER 1: The "Wide Net" (Construction, Development, Infrastructure)
+WIDE_NET = [
+    "planning", "development", "construction", "renovation", "extension", 
+    "demolition", "landscape", "garden", "site", "works", "erection", 
+    "alteration", "reconstruction", "infrastructure", "nature"
+]
+
+# TIER 2: The "Refined Search" (Tree Surgery Specifics)
+TREE_SURGERY = [
+    "tree", "tpo", "fell", "felling", "crown", "pruning", "stump", 
+    "oak", "ash", "sycamore", "cedar", "birch", "willow", "pine", "reduction"
+]
 
 def smart_classify(record):
+    """Refines search layer by layer to identify high-value leads."""
+    # Find the data column (description)
     description = ""
-    for key, value in record.items():
-        if any(hk in key.lower() for hk in HEADER_KEYWORDS):
-            description = str(value).lower()
+    headers = ["proposal", "description", "development_description", "nature_of_work", "details", "PROPOSAL"]
+    for h in headers:
+        if record.get(h):
+            description = str(record.get(h)).lower()
             break
-    if not description: return False, 0
-    score = sum(2 for word in TREE_SPECIFIC if word in description)
+    
+    if not description:
+        return False, 0
+
+    # Step 1: Broad Check (Are we looking at construction/development?)
+    if not any(word in description for word in WIDE_NET):
+        return False, 0
+
+    # Step 2: Refined Check (Is it specifically about trees?)
+    matches = [word for word in TREE_SURGERY if word in description]
+    score = len(matches)
+    
+    # Priority weighting
     if "tree" in description: score += 5
-    return (score > 4), score
+    if any(x in description for x in ["fell", "felling", "tpo"]): score += 10
 
-def get_d(r):
-    v = r.get("received_date") or r.get("DATE_RECEIVED") or r.get("DATE_VALID") or r.get("DATEAPVAL") or 0
-    if isinstance(v, str):
-        try: return datetime.fromisoformat(v.replace('Z', '+00:00')).timestamp() * 1000
-        except: return 0
-    return float(v)
+    # Minimum threshold to avoid 'noise' (e.g. house with a single tree mention)
+    return (score >= 12), score
 
-# --- FETCHING ENGINE (The Verified Identity V30) ---
+# --- DATA ACQUISITION ENGINE ---
 def fetch_council(name, config):
     session = requests.Session()
-    # Identifying as a legitimate research tool to establish server trust
+    # "High-Vis Vest" Header: Identifying as a legitimate professional tool
     h = {
-        "User-Agent": "VectorDataLabs/30.0 (PropTech Research Tool for Local Business; contact: admin@vectordata.labs)",
+        "User-Agent": "VectorDataLabs/32.0 (Open-Data Business Integration; contact: admin@vectordata.labs)",
         "Accept": "application/json",
         "Referer": config.get("referer", "https://www.google.com")
     }
@@ -84,24 +105,26 @@ def fetch_council(name, config):
     try:
         if config["type"] == "arcgis":
             q = {"where": "1=1", "outFields": "*", "resultRecordCount": 100, "orderByFields": "OBJECTID DESC", "f": "json"}
-            res = session.get(config["url"], params=q, headers=h, timeout=25, verify=False)
+            res = session.get(config["url"], params=q, headers=h, timeout=30, verify=False)
         else:
-            res = session.get(config["url"], params=config.get("params"), headers=h, timeout=25)
+            # REST API Path
+            res = session.get(config["url"], params=config.get("params"), headers=h, timeout=30)
 
-        if res.status_code != 200: return [], f"HTTP {res.status_code}"
-        if "application/json" not in res.headers.get("Content-Type", ""):
-            return [], "Security Challenge (HTML)"
+        if res.status_code != 200:
+            return [], f"HTTP {res.status_code} Error"
 
         data = res.json()
         if config["type"] == "arcgis":
-            return [f.get("attributes", {}) for f in data.get("features", [])], "Online"
+            records = [f.get("attributes", {}) for f in data.get("features", [])]
         else:
-            return data.get("results", []), "Online"
+            records = data.get("results", [])
+            
+        return records, "Online"
 
     except Exception as e:
-        return [], f"Fault: {str(e)}"
+        return [], f"Connection Fault: {str(e)}"
 
-# --- DATABASE OPERATIONS ---
+# --- DATABASE & WEBHOOKS ---
 def is_already_sent(ref):
     if not SURL: return False
     try:
@@ -124,7 +147,17 @@ def mark_as_sent(ref):
 # --- ROUTES ---
 @app.get("/")
 def lander():
-    return f"<html><body style='font-family:sans-serif; text-align:center; padding-top:50px;'><h1>Vector Data Labs V30.0</h1><p>Verified Identity Integration Online</p><a href='/test-regional'>Run Diagnostic</a></body></html>"
+    return f"""
+    <html><body style='font-family:sans-serif; text-align:center; padding-top:50px; background:#fafafa;'>
+    <div style='display:inline-block; padding:40px; background:white; border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,0.05); border-top: 5px solid #2e7d32;'>
+    <h1>Vector Data Labs V32.0</h1>
+    <p>Leeds Baseline: <b>ACTIVE</b> | London Strategy: <b>SIDE-DOORS</b></p>
+    <p style='color:green;'>Tiered Search & Official Identity Enabled.</p>
+    <hr style='border:0; border-top:1px solid #eee; margin:20px 0;'/>
+    <a href='/test-regional' style='color:#2e7d32; text-decoration:none; font-weight:bold;'>Run Full System Diagnostic</a>
+    </div>
+    </body></html>
+    """
 
 @app.get("/test-regional")
 def test_all():
@@ -140,32 +173,40 @@ def scrape(secret: str = Query(...)):
     if secret != T_SEC: raise HTTPException(status_code=401)
     leads_sent = 0
     cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).timestamp() * 1000
+    
     for c_name, config in COUNCILS.items():
         recs, _ = fetch_council(c_name, config)
         for r in recs:
             ref = str(r.get("external_system_reference") or r.get("REFERENCE") or r.get("OBJECTID"))
             is_valid, _ = smart_classify(r)
-            if is_valid and (get_d(r) >= cutoff or get_d(r) == 0) and not is_already_sent(ref):
-                addr = r.get('full_address') or r.get('ADDRESS') or r.get('LOCATION') or r.get('SITE_ADDRESS')
+            
+            if is_valid and not is_already_sent(ref):
+                addr = r.get('full_address') or r.get('ADDRESS') or r.get('LOCATION')
                 prop = ""
-                for k, v in r.items():
-                    if any(hk in k.lower() for hk in HEADER_KEYWORDS): prop = v; break
+                for h in ["proposal", "description", "development_description", "PROPOSAL"]:
+                    if r.get(h): prop = r.get(h); break
+                
                 try:
                     ai = client.chat.completions.create(
-                        model="gpt-4o-mini", response_format={"type": "json_object"},
-                        messages=[{"role": "system", "content": "Return JSON: applicant_name, site_address, postcode, scope_summary, high_value (bool)."},
-                        {"role": "user", "content": f"Addr: {addr} Prop: {prop}"}]
+                        model="gpt-4o-mini", 
+                        response_format={"type": "json_object"},
+                        messages=[
+                            {"role": "system", "content": "Return JSON: applicant_name, site_address, postcode, scope_summary, high_value (bool)."},
+                            {"role": "user", "content": f"Addr: {addr} Prop: {prop}"}
+                        ]
                     )
                     ld = json.loads(ai.choices[0].message.content)
                 except: continue
+
                 surgeons = [{"id": 1, "email": T_EM}]
                 if SURL:
                     try:
-                        db = psycopg2.connect(SURL); cur = db.cursor()
+                        db = psycopg2.connect(SURL); c = db.cursor()
                         c.execute("SELECT id, email FROM tree_surgeons WHERE active IS TRUE")
                         surgeons = [{"id": row[0], "email": row[1]} for row in c.fetchall()] or surgeons
                         db.close()
                     except: pass
+
                 for sgn in surgeons:
                     amt = 6000 if ld.get("high_value") else 3500
                     checkout = stripe.checkout.Session.create(
@@ -174,8 +215,9 @@ def scrape(secret: str = Query(...)):
                         mode="payment", success_url=f"{P_URL}/payment-success", cancel_url=f"{P_URL}/payment-cancelled",
                         metadata={"surgeon_id": str(sgn["id"]), "ref": ref, "site_address": ld.get("site_address")}
                     )
-                    email_html = f"<h2>New Lead: {c_name}</h2><p>{ld.get('scope_summary')}</p><a href='{checkout.url}'>Purchase Lead</a>"
-                    requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [sgn["email"]], "subject": f"Lead: {ld.get('site_address')}", "html": email_html}, headers={"Authorization": f"Bearer {R_KEY}"})
+                    email_html = f"<h2>New Lead: {c_name}</h2><p>{ld.get('scope_summary')}</p><a href='{checkout.url}'>Purchase Lead Details</a>"
+                    requests.post(R_URL, json={"from": "Vector Data Labs <leads@resend.dev>", "to": [sgn["email"]], "subject": f"Lead: {ld.get('site_address')}", "html": email_html}, headers={"Authorization": f"Bearer {R_KEY}"})
+                
                 mark_as_sent(ref)
                 leads_sent += 1
                 if leads_sent >= 10: break
