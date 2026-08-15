@@ -5,9 +5,8 @@ from fastapi.responses import HTMLResponse
 from openai import OpenAI
 
 # Professional Stability Setup
-# This line is crucial: it stops the AI from complaining about 'unverified' security badges
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-app = FastAPI(title="Vector Data Labs - V49.0 Discovery Master", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs - V50.0 Discovery Master", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
@@ -24,7 +23,7 @@ R_URL = "https://api.resend.com/emails"
 client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 
-# --- DATA ARCHITECTURE (V49.0 Verified) ---
+# --- DATA ARCHITECTURE (V50.0 Verified) ---
 COUNCILS = {
     "Leeds_City_Control": {
         "type": "arcgis",
@@ -35,7 +34,6 @@ COUNCILS = {
         "type": "aura",
         "url": "https://arcusbe.manchester.gov.uk/pr/s/sfsites/aura",
         "referer": "https://arcusbe.manchester.gov.uk/pr/s/register-view?c__r=Arcus_BE_Public_Register",
-        # Extracted from your successful cURL capture
         "fwuid": "OUcwT3JDYUZld21JQ2ZOckR1VnppUWtVMjdnTGFERUU2S3FfSVdrcU92bkExNC4xOTIuODM4ODYwOA",
         "app_id": "1706_8wJLrETnpOGvg7aPJCutcg",
         "page_scope": "32c0b64d-4f6a-480c-bc4c-eb195dbfb461",
@@ -44,7 +42,7 @@ COUNCILS = {
 }
 
 # --- CLASSIFICATION LOGIC ---
-CABINET_HEADERS = ["proposal", "description", "development_description", "nature", "details", "PROPOSAL", "siteAddress"]
+CABINET_HEADERS = ["proposal", "description", "development_description", "nature", "details", "PROPOSAL", "siteAddress", "address"]
 TREE_GOLD = ["tree", "tpo", "fell", "felling", "arboriculture", "crown", "pruning", "stump", "oak", "ash", "willow", "cedar"]
 
 def smart_classify(record):
@@ -71,7 +69,6 @@ def fetch_council(name, config):
     try:
         if config["type"] == "arcgis":
             params = {"where": "1=1", "outFields": "*", "resultRecordCount": 50, "orderByFields": "OBJECTID DESC", "f": "json"}
-            # We use verify=False here to bypass SSL certificate issues
             res = session.get(config["url"], params=params, headers=headers, timeout=15, verify=False)
             if res.status_code == 200:
                 return [f.get("attributes", {}) for f in res.json().get("features", [])], "Online"
@@ -83,33 +80,31 @@ def fetch_council(name, config):
             aura_context = {"mode": "PROD", "fwuid": config["fwuid"], "app": "siteforce:communityApp", 
                             "loaded": {"APPLICATION@markup://siteforce:communityApp": config["app_id"]}}
             
+            # We are now targeting 'Building_Control_Applications' as per your working cURL
             message = {"actions": [{"id": "1;a", "descriptor": "aura://ApexActionController/ACTION$execute", 
                         "params": {"namespace": "arcuscommunity", "classname": "PR_SearchService", "method": "search", 
                         "params": {"request": {"registerName": "Arcus_BE_Public_Register", "searchType": "quick", 
-                        "searchTerm": "tree", "searchName": "Planning_Applications"}}}}]}
+                        "searchTerm": "oak", "searchName": "Building_Control_Applications"}}}}]}
             
             payload = {"message": json.dumps(message), "aura.context": json.dumps(aura_context), "aura.token": "null"}
             
-            # Added verify=False here to bypass the Manchester 'local issuer certificate' error
             res = session.post(config["url"], data=payload, headers=headers, timeout=20, verify=False)
             if res.status_code == 200:
                 data = res.json()
+                # Manchester (Arcus) returns a very complex structure. We need to dig deep:
                 if 'actions' in data and data['actions'][0].get('state') == 'SUCCESS':
                     return data['actions'][0]['returnValue'].get('records', []), "Online"
-                return [], "Online (No Data)"
-            return [], f"Handshake Refused ({res.status_code})"
+                return [], "Online (Empty Search)"
 
-        return [], "Offline"
+        return [], f"Offline ({res.status_code})"
     except Exception as e:
-        return [], f"Connection Fault"
+        return [], "Connection Fault"
 
 # --- PERSISTENCE ---
 def is_already_sent(ref):
     if not SURL: return False
     try:
         conn = psycopg2.connect(SURL); cur = conn.cursor()
-        cur.execute("CREATE TABLE IF NOT EXISTS sent_leads (ref TEXT PRIMARY KEY, sent_at TIMESTAMPTZ DEFAULT NOW());")
-        conn.commit()
         cur.execute("SELECT 1 FROM sent_leads WHERE ref = %s", (ref,))
         exists = cur.fetchone() is not None; conn.close()
         return exists
@@ -130,10 +125,10 @@ def lander():
     <html><body style='font-family:sans-serif; text-align:center; padding-top:50px; background:#f4f4f9;'>
     <div style='display:inline-block; padding:50px; background:white; border-radius:15px; box-shadow:0 10px 30px rgba(0,0,0,0.1); border-top: 6px solid #1b5e20; max-width:600px;'>
         <h1 style='color:#1b5e20;'>Vector Data Labs</h1>
-        <p>Integration Hub V49.0</p>
+        <p>Integration Hub V50.0</p>
         <div style='background:#f1f8e9; padding:15px; border-radius:10px; margin:20px 0; text-align:left; font-size:14px;'>
             <b>Leeds:</b> Active<br/>
-            <b>Manchester:</b> SSL Bypass Applied
+            <b>Manchester:</b> Target - Building Control
         </div>
         <a href='/test-regional' style='display:inline-block; padding:12px 25px; background:#1b5e20; color:white; text-decoration:none; border-radius:5px; font-weight:bold;'>Check Live Leads Feed</a>
     </div>
@@ -158,7 +153,6 @@ def scrape(secret: str = Query(...)):
         for r in recs:
             ref = str(r.get("REFERENCE") or r.get("OBJECTID") or r.get("Id") or r.get("_id"))
             if smart_classify(r)[0] and not is_already_sent(ref):
-                # Leads found, send via AI + Stripe
                 mark_as_sent(ref)
                 leads_sent += 1
     return {"status": "success", "leads_sent": leads_sent}
