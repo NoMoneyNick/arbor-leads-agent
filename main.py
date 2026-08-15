@@ -8,7 +8,7 @@ from openai import OpenAI
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
-app = FastAPI(title="Vector Data Labs - V17.1 Official Master", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs - V17.2 Master", docs_url="/docs")
 
 # --- ENVIRONMENT VARIABLES ---
 OKEY, SURL = os.getenv("OPENAI_API_KEY"), os.getenv("SUPABASE_DB_URL")
@@ -22,23 +22,23 @@ stripe.api_key = S_SEC
 _processed = set()
 
 # --- OFFICIAL ENDPOINT CONFIGURATION ---
-# We use the verified 2024/2025 production paths for official government feeds.
+# These are the direct, publicly available ArcGIS FeatureServer links used by the councils.
 COUNCILS = {
     "Leeds_City": {
         "type": "arcgis",
         "url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query",
         "referer": "https://www.leeds.gov.uk/"
     },
-    "London_Datahub": {
-        "type": "rest_api",
-        # Verified Official GLA Developer Subdomain
-        "url": "https://planning.data.london.gov.uk/api/v1/applications/",
-        "params": {"page_size": 50}
+    "London_Mega_Hub": {
+        "type": "arcgis",
+        # Direct public ArcGIS link for the GLA Planning Datahub
+        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_London_Datahub/FeatureServer/0/query",
+        "referer": "https://www.london.gov.uk/"
     },
     "Woking_Surrey": {
         "type": "arcgis",
-        # Verified 2024 Production Path for the Surrey Cluster
-        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications_Woking/FeatureServer/0/query",
+        # Corrected service name for the shared Surrey/London cluster
+        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications/FeatureServer/0/query",
         "referer": "https://www.woking.gov.uk/"
     }
 }
@@ -57,35 +57,43 @@ def get_d(r):
 def classify(r):
     p = str(r.get("development_description") or r.get("description") or r.get("PROPOSAL") or r.get("DESCRIPTION") or "").lower()
     if not p: return False, 0
+    
     matches = [k for k in TREE_WORDS if k in p]
     score = len(matches)
     if "tree" in p: score += 2
     if any(x in p for x in ["fell", "remove", "crown", "tpo"]): score += 5
+    
     if any(w in p for w in SKIP_WORDS) and score < 8: return False, 0
     return (score > 2), score
 
-# --- FETCHING LOGIC (Authorized API Pattern) ---
+# --- FETCHING LOGIC ---
 def fetch_data(name, config):
     h = {
-        "User-Agent": "VectorDataLabs/1.1 (Official Public Data Integration)",
+        "User-Agent": "VectorDataLabs/1.2 (Official Public Data Integration)",
         "Accept": "application/json"
     }
     try:
         if config["type"] == "arcgis":
             h["Referer"] = config["referer"]
-            q = {"where": "1=1", "outFields": "*", "resultRecordCount": 50, "orderByFields": "OBJECTID DESC", "f": "json"}
+            q = {
+                "where": "1=1",
+                "outFields": "*",
+                "resultRecordCount": 50,
+                "orderByFields": "OBJECTID DESC",
+                "f": "json"
+            }
             res = requests.get(config["url"], params=q, headers=h, timeout=25)
         else:
             res = requests.get(config["url"], params=config.get("params", {}), headers=h, timeout=25)
 
-        if res.status_code == 404:
-            return [], "404: Subdomain/Path Update Required"
         if res.status_code != 200:
             return [], f"HTTP {res.status_code}"
         
         data = res.json()
+        if "error" in data:
+            return [], f"ArcGIS Error: {data['error'].get('message')}"
+            
         if config["type"] == "arcgis":
-            if "error" in data: return [], f"ArcGIS: {data['error'].get('message')}"
             return [f.get("attributes", {}) for f in data.get("features", [])], "Online"
         else:
             return data.get("results", []) or data.get("applications", []), "Online"
@@ -119,10 +127,10 @@ def lander():
     return f"""
     <html><body style='font-family:sans-serif;text-align:center;padding-top:50px; background:#fafafa;'>
     <div style='display:inline-block; padding:40px; background:white; border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,0.05); border-top: 5px solid #1a73e8;'>
-    <h1>Vector Data Labs V17.1</h1>
-    <p>Leeds: <b>ONLINE</b> | London Hub: <b>VERIFYING</b></p>
+    <h1>Vector Data Labs V17.2</h1>
+    <p>Leeds: <b>ONLINE</b> | London/Surrey: <b>CONNECTING</b></p>
     <hr style='border:0; border-top:1px solid #eee; margin:20px 0;'/>
-    <a href='/test-regional' style='color:#1a73e8; text-decoration:none; font-weight:bold;'>Check System Health</a>
+    <a href='/test-regional' style='color:#1a73e8; text-decoration:none; font-weight:bold;'>Run Regional Health Check</a>
     </div>
     </body></html>
     """
@@ -133,7 +141,7 @@ def test_all():
     for name, config in COUNCILS.items():
         recs, status = fetch_data(name, config)
         found = [r for r in recs if classify(r)[0]]
-        results[name] = {"status": status, "records_found": len(recs), "tree_leads": len(found)}
+        results[name] = {"status": status, "scanned": len(recs), "tree_leads": len(found)}
     return results
 
 @app.get("/trigger-scrape")
@@ -145,6 +153,7 @@ def scrape(secret: str = Query(...)):
     for c_name, config in COUNCILS.items():
         recs, _ = fetch_data(c_name, config)
         for r in recs:
+            # Multi-API Reference Generator
             ref = str(r.get("external_system_reference") or r.get("REFERENCE") or r.get("OBJECTID"))
             is_valid, _ = classify(r)
             
@@ -157,7 +166,7 @@ def scrape(secret: str = Query(...)):
                         model="gpt-4o-mini", 
                         response_format={"type": "json_object"},
                         messages=[
-                            {"role": "system", "content": "Return JSON: applicant_name, site_address, postcode, scope_summary, high_value (bool). High value if multiple trees or major felling."},
+                            {"role": "system", "content": "Return JSON: applicant_name, site_address, postcode, scope_summary, high_value (bool)."},
                             {"role": "user", "content": f"Addr: {addr} Prop: {prop}"}
                         ]
                     )
@@ -181,7 +190,7 @@ def scrape(secret: str = Query(...)):
                         mode="payment", success_url=f"{P_URL}/payment-success", cancel_url=f"{P_URL}/payment-cancelled",
                         metadata={"surgeon_id": str(sgn["id"]), "ref": ref, "site_address": ld.get("site_address")}
                     )
-                    email_html = f"<h2>New Lead: {c_name}</h2><p><b>Summary:</b> {ld.get('scope_summary')}</p><a href='{checkout.url}'>Purchase Contact Details</a>"
+                    email_html = f"<h2>New Tree Lead: {c_name}</h2><p>{ld.get('scope_summary')}</p><a href='{checkout.url}'>Purchase Lead Details</a>"
                     requests.post(R_URL, json={"from": "Vector Data Labs <leads@resend.dev>", "to": [sgn["email"]], "subject": f"Lead: {ld.get('site_address')}", "html": email_html}, headers={"Authorization": f"Bearer {R_KEY}"})
                 
                 mark_as_sent(ref)
@@ -189,20 +198,6 @@ def scrape(secret: str = Query(...)):
                 if leads_sent >= 10: break
         if leads_sent >= 10: break
     return {"status": "success", "leads_sent": leads_sent}
-
-@app.post("/webhook", include_in_schema=False)
-async def webhook(req: Request):
-    sig, payload = req.headers.get("stripe-signature"), await req.body()
-    try:
-        event = stripe.Webhook.construct_event(payload, sig, S_WH)
-        if event["type"] == "checkout.session.completed":
-            sess = event["data"]["object"]
-            if sess["id"] not in _processed:
-                _processed.add(sess["id"])
-                m = sess["metadata"]
-                requests.post(R_URL, json={"from": "Vector Data Labs <leads@resend.dev>", "to": [T_EM], "subject": "   SALE!", "html": f"Lead Paid: {m.get('site_address')}"}, headers={"Authorization": f"Bearer {R_KEY}"})
-    except: pass
-    return {"status": "ok"}
 
 @app.get("/payment-success", include_in_schema=False)
 def success(): return HTMLResponse("<h1>Success!</h1>")
