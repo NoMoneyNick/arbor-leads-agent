@@ -7,7 +7,7 @@ from openai import OpenAI
 # Disable SSL warnings for internal council certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="Vector Data Labs - V16.2 Master", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs - V16.3 Master", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
@@ -22,36 +22,36 @@ client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# --- THE MASTER LIST (V16.2 Verified Production Paths) ---
-# We use the absolute latest 2024 naming conventions for these ArcGIS hubs.
+# --- THE MASTER LIST (V16.3 Path Normalization) ---
+# We use the 'Root' service names which are the most stable during infrastructure migrations.
 COUNCILS = {
     "Leeds_Control": {
         "url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query",
         "referer": "https://www.leeds.gov.uk/"
     },
     "London_Mega_Hub": {
-        # Targeting the official GLA consolidated feed layer
-        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_London_Datahub/FeatureServer/0/query",
+        # Normalized to the root 'Planning' path for the S96p cluster
+        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning/FeatureServer/0/query",
         "referer": "https://www.london.gov.uk/"
     },
     "Richmond_Wandsworth": {
-        # Using the standard shared service naming pattern
+        # Reverting to the primary shared service name
         "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications/FeatureServer/0/query",
         "referer": "https://www.wandsworth.gov.uk/"
     },
     "Woking_Surrey": {
-        # Woking uses a specific borough suffix on the shared cluster
+        # Using the standardized borough specific suffix
         "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications_Woking/FeatureServer/0/query",
         "referer": "https://www.woking.gov.uk/"
     },
     "Croydon_Direct": {
-        # Re-pointing to their MapServer with the new 'Heavy Mask' headers
+        # Updated URL and Referer to mimic the exact official portal origin
         "url": "https://maps.croydon.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
-        "referer": "https://www.croydon.gov.uk/"
+        "referer": "https://maps.croydon.gov.uk/planning/index.html"
     }
 }
 
-# --- LOGIC: CLASSIFICATION & DATE HANDLING ---
+# --- LOGIC: CLASSIFICATION ---
 TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "stump", "arboriculture", "oak", "ash ", "cedar", "conifer", "birch", "maple", "willow", "sycamore"]
 SKIP_WORDS = ["dwelling", "erection of", "new build", "extension", "loft conversion", "demolition"]
 
@@ -64,7 +64,7 @@ def get_d(r):
     except: return 0
 
 def classify(r):
-    p = str(r.get("development_description") or r.get("description") or r.get("PROPOSAL") or r.get("DESCRIPTION") or "").lower()
+    p = str(r.get("development_description") or r.get("PROPOSAL") or r.get("DESCRIPTION") or r.get("DESCRIPT") or r.get("DETDESC") or "").lower()
     if not p: return False, 0
     matches = [k for k in TREE_WORDS if k in p]
     score = len(matches)
@@ -73,30 +73,30 @@ def classify(r):
     if any(w in p for w in SKIP_WORDS) and score < 8: return False, 0
     return (score > 2), score
 
-# --- FETCHING LOGIC (The Heavy Mask V16.2) ---
+# --- FETCHING LOGIC (Origin Spoofing V16.3) ---
 def fetch_council(name, config):
     url = config["url"]
-    # Residential browser fingerprint to bypass WAFs
     h = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-GB,en;q=0.9",
         "Referer": config["referer"],
+        "Origin": config["referer"].split("/planning")[0], # Dynamic origin spoofing
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Site": "cross-site",
         "Connection": "keep-alive"
     }
     q = {"where": "1=1", "outFields": "*", "resultRecordCount": 50, "orderByFields": "OBJECTID DESC", "f": "json"}
     try:
-        res = requests.get(url, params=q, headers=h, timeout=25, verify=False)
-        if res.status_code == 404: return [], "404 Not Found (Path Changed)"
+        res = requests.get(url, params=q, headers=h, timeout=30, verify=False)
+        if res.status_code == 404: return [], "Path Rotated (404)"
         if res.status_code != 200: return [], f"HTTP {res.status_code} Error"
         
         try:
             data = res.json()
         except:
-            return [], "Firewall: Blocked (HTML response)"
+            return [], "HTML Firewall Blocked (Access Denied)"
             
         if "error" in data: return [], f"ArcGIS: {data['error'].get('message')}"
         
@@ -131,8 +131,8 @@ def lander():
     return f"""
     <html><body style='font-family:sans-serif;text-align:center;padding-top:50px; background:#f4f4f9;'>
     <div style='display:inline-block; padding:40px; background:white; border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,0.05); border-top: 5px solid #2e7d32;'>
-    <h1>Vector Data Labs V16.2</h1>
-    <p>Leeds: <b>ACTIVE</b> | London: <b>RECOVERY</b></p>
+    <h1>Vector Data Labs V16.3</h1>
+    <p>Leeds: <b>ACTIVE</b> | London: <b>PATH NORMALIZATION</b></p>
     <hr style='border:0; border-top:1px solid #eee; margin:20px 0;'/>
     <a href='/test-regional' style='color:#2e7d32; text-decoration:none; font-weight:bold;'>Run Regional Health Check</a>
     </div>
@@ -192,12 +192,12 @@ def scrape(secret: str = Query(...)):
                         metadata={"surgeon_id": str(sgn["id"]), "ref": ref, "site_address": ld.get("site_address")}
                     )
                     email_html = f"""
-                    <div style='font-family:sans-serif; border-left: 8px solid #2e7d32; padding:20px; background:#f9f9f9;'>
-                    <h2 style='color:#2e7d32;'>New Tree Lead: {c_name}</h2>
+                    <div style='font-family:sans-serif; border-left: 8px solid #1a73e8; padding:20px; background:#f9f9f9;'>
+                    <h2 style='color:#1a73e8;'>New Tree Lead: {c_name}</h2>
                     <p><strong>Work:</strong> {ld.get('scope_summary')}</p>
                     <p><strong>Location:</strong> {ld.get('site_address')}</p>
                     <br/>
-                    <a href='{checkout.url}' style='background:#2e7d32; color:white; padding:15px 30px; text-decoration:none; border-radius:5px; font-weight:bold; display:inline-block;'>Buy Lead Details (£{amt/100})</a>
+                    <a href='{checkout.url}' style='background:#1a73e8; color:white; padding:15px 30px; text-decoration:none; border-radius:5px; font-weight:bold; display:inline-block;'>Buy Lead Details (£{amt/100})</a>
                     </div>
                     """
                     requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [sgn["email"]], "subject": f"Lead: {ld.get('site_address')}", "html": email_html}, headers={"Authorization": f"Bearer {R_KEY}"})
