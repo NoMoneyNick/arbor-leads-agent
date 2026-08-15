@@ -6,55 +6,51 @@ from openai import OpenAI
 
 # Professional Stability Setup
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-app = FastAPI(title="Vector Data Labs - V40.0 Discovery Master", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs - V42.0 Discovery Master", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
 # --- ENVIRONMENT ---
-OKEY, SURL = os.getenv("OPENAI_API_KEY"), os.getenv("SUPABASE_DB_URL")
-S_SEC, S_WH = os.getenv("STRIPE_SECRET_KEY"), os.getenv("STRIPE_WEBHOOK_SECRET")
-R_KEY, T_EM = os.getenv("RESEND_API_KEY"), os.getenv("TEST_EMAIL")
-T_SEC, P_URL = os.getenv("TRIGGER_SECRET"), os.getenv("PUBLIC_APP_URL")
-GLA_KEY = os.getenv("GLA_API_KEY") # Your key: 4fa7bca7-07b0-4575-83bb-0b8ad4f21e97
+OKEY = os.getenv("OPENAI_API_KEY")
+SURL = os.getenv("SUPABASE_DB_URL")
+S_SEC = os.getenv("STRIPE_SECRET_KEY")
+R_KEY = os.getenv("RESEND_API_KEY")
+T_EM = os.getenv("TEST_EMAIL") # Your notification email
+T_SEC = os.getenv("TRIGGER_SECRET") # Your scrape password
+P_URL = os.getenv("PUBLIC_APP_URL")
+GLA_KEY = os.getenv("GLA_API_KEY") 
 
 R_URL = "https://api.resend.com/emails"
 client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
-_processed = set()
 
-# --- THE OFFICIAL DATA ARCHITECTURE (V40.0 Verified) ---
+# --- DATA ARCHITECTURE (V42.0 Verified) ---
 COUNCILS = {
     "Leeds_City_Control": {
         "type": "arcgis",
         "url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query",
         "referer": "https://www.leeds.gov.uk/"
     },
+    "Manchester_City_Control": {
+        "type": "arcgis",
+        "url": "https://pa.manchester.gov.uk/arcgis/rest/services/Public/Planning_Applications/MapServer/0/query",
+        "referer": "https://www.manchester.gov.uk/planning"
+    },
     "London_Official_Hub": {
         "type": "ckan",
-        # Hitting the official 'Search Artery' on the Datastore floor plan you provided
         "url": "https://data.london.gov.uk/api/3/action/datastore_search",
-        # This is the unique 'Room Number' for the live Planning Hub
         "resource_id": "847f2b1a-3852-475a-bcaf-192a29792664",
         "params": {"limit": 100}
-    },
-    "Surrey_Shared_Hub": {
-        "type": "arcgis",
-        # Using the direct cloud pipe found in our borough discovery
-        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications_Woking/FeatureServer/0/query",
-        "referer": "https://www.woking.gov.uk/"
     }
 }
 
-# --- HUMAN LOGIC: TIERED REFINEMENT ---
-# Tier 1: Identify the column (The Cabinet)
+# --- CLASSIFICATION LOGIC ---
 CABINET_HEADERS = ["proposal", "description", "development_description", "nature", "details", "PROPOSAL"]
-# Tier 2: Search for trees (The Gold)
 TREE_GOLD = ["tree", "tpo", "fell", "felling", "arboriculture", "crown", "pruning", "stump", "oak", "ash", "willow", "cedar"]
-# Tier 3: Search for context (The Right Room)
 PLANNING_CONTEXT = ["planning", "development", "construction", "extension", "works", "site"]
 
 def smart_classify(record):
-    """Tiered search logic using your human-guided perspective."""
+    """3-Tier refinement to identify tree surgery leads."""
     description = ""
     for key, value in record.items():
         if any(h in key.lower() for h in CABINET_HEADERS):
@@ -63,60 +59,58 @@ def smart_classify(record):
     
     if not description: return False, 0
 
-    # Human Logic Layer 1: Search for Trees first
     tree_matches = [word for word in TREE_GOLD if word in description]
     if tree_matches:
         score = len(tree_matches) * 5
-        # High value indicators
         if any(x in description for x in ["fell", "felling", "tpo"]): score += 15
         return (score >= 10), score
-
-    # Human Logic Layer 2: Context Check (Are we looking at the right file?)
-    if any(word in description for word in PLANNING_CONTEXT):
-        # We are in the right room, but this isn't a tree lead
-        return False, 0
 
     return False, 0
 
 def get_d(r):
-    # Standardizes Date Strings (London API) and Timestamps (ArcGIS)
+    """Standardizes date formats across different Council APIs."""
     v = r.get("received_date") or r.get("DATE_RECEIVED") or r.get("DATE_VALID") or 0
     if isinstance(v, str):
         try: return datetime.fromisoformat(v.replace('Z', '+00:00')).timestamp() * 1000
         except: return 0
     return float(v)
 
-# --- THE AUTHORIZED DATA ENGINE (V40.0) ---
+# --- AUTHORIZED DATA ENGINE ---
 def fetch_council(name, config):
     session = requests.Session()
-    h = {
-        "User-Agent": "VectorDataLabs/40.0 (Professional Data Integration; contact: admin@vectordata.labs)",
+    headers = {
+        "User-Agent": "VectorDataLabs/42.0 (Professional Data Integration)",
         "Accept": "application/json"
     }
-    
     try:
         if config["type"] == "ckan":
-            # Using your 'Key to the Building' to authenticate
-            if GLA_KEY: h["Authorization"] = GLA_KEY 
-            params = {**config["params"], "resource_id": config["resource_id"]}
-            res = session.get(config["url"], params=params, headers=h, timeout=30)
+            if GLA_KEY: headers["Authorization"] = GLA_KEY
+            params = {**config.get("params", {}), "resource_id": config["resource_id"]}
+            res = session.get(config["url"], params=params, headers=headers, timeout=30)
             if res.status_code == 200:
-                # CKAN returns data in ['result']['records']
-                return res.json().get("result", {}).get("records", []), "Online (Key Accepted)"
+                return res.json().get("result", {}).get("records", []), "Online"
             return [], f"API Error: {res.status_code}"
 
         elif config["type"] == "arcgis":
-            h["Referer"] = config["referer"]
-            q = {"where": "1=1", "outFields": "*", "resultRecordCount": 100, "orderByFields": "OBJECTID DESC", "f": "json"}
-            res = session.get(config["url"], params=q, headers=h, timeout=30, verify=False)
+            headers["Referer"] = config["referer"]
+            # Requesting last 100 entries sorted by ID
+            query_params = {
+                "where": "1=1", 
+                "outFields": "*", 
+                "resultRecordCount": 100, 
+                "orderByFields": "OBJECTID DESC", 
+                "f": "json"
+            }
+            res = session.get(config["url"], params=query_params, headers=headers, timeout=30, verify=False)
             if res.status_code == 200:
                 return [f.get("attributes", {}) for f in res.json().get("features", [])], "Online"
+            return [], f"HTTP {res.status_code}"
 
     except Exception as e:
         return [], f"Fault: {str(e)}"
     return [], "Offline"
 
-# --- DATABASE & WEBHOOKS (Preserved Core) ---
+# --- PERSISTENCE LAYER ---
 def is_already_sent(ref):
     if not SURL: return False
     try:
@@ -136,25 +130,26 @@ def mark_as_sent(ref):
         conn.commit(); conn.close()
     except: pass
 
-# --- ROUTES ---
+# --- APP INTERFACE ---
 @app.get("/")
 def lander():
     return f"""
     <html><body style='font-family:sans-serif; text-align:center; padding-top:50px; background:#f4f4f9;'>
     <div style='display:inline-block; padding:50px; background:white; border-radius:15px; box-shadow:0 10px 30px rgba(0,0,0,0.1); border-top: 6px solid #1b5e20; max-width:600px;'>
-    <h1 style='color:#1b5e20;'>Vector Data Labs</h1>
-    <p>Official Developer Integration Hub V40.0</p>
-    <div style='background:#f1f8e9; padding:15px; border-radius:10px; margin:20px 0; text-align:left; font-size:14px;'>
-    <b>Status:</b> Leeds Control Active | London Datastore Authenticated.<br/>
-    <b>Logic:</b> Tiered Refinement (Tree-First Discovery).
-    </div>
-    <a href='/test-regional' style='display:inline-block; padding:12px 25px; background:#1b5e20; color:white; text-decoration:none; border-radius:5px; font-weight:bold;'>Check Live Leads Feed</a>
+        <h1 style='color:#1b5e20;'>Vector Data Labs</h1>
+        <p>Lead-Gen Integration Hub V42.0</p>
+        <div style='background:#f1f8e9; padding:15px; border-radius:10px; margin:20px 0; text-align:left; font-size:14px;'>
+            <b>Active Baselines:</b> Leeds, Manchester<br/>
+            <b>Awaiting Handshake:</b> London GLA, Croydon
+        </div>
+        <a href='/test-regional' style='display:inline-block; padding:12px 25px; background:#1b5e20; color:white; text-decoration:none; border-radius:5px; font-weight:bold;'>Verify Regional Feeds</a>
     </div>
     </body></html>
     """
 
 @app.get("/test-regional")
 def test_all():
+    """Diagnostic route to check connection status of all targets."""
     results = {}
     for name, config in COUNCILS.items():
         recs, status = fetch_council(name, config)
@@ -164,53 +159,64 @@ def test_all():
 
 @app.get("/trigger-scrape")
 def scrape(secret: str = Query(...)):
+    """Primary automation route to process leads and generate Stripe checkouts."""
     if secret != T_SEC: raise HTTPException(status_code=401)
     leads_sent = 0
     cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).timestamp() * 1000
+    
     for c_name, config in COUNCILS.items():
         recs, _ = fetch_council(c_name, config)
         for r in recs:
-            # Smart Reference Detection
-            ref = str(r.get("external_system_reference") or r.get("REFERENCE") or r.get("_id") or r.get("OBJECTID"))
+            # Detect the best reference ID for the lead
+            ref = str(r.get("REFERENCE") or r.get("OBJECTID") or r.get("PLAN_APP_REF") or r.get("_id"))
             is_valid, _ = smart_classify(r)
+            
             if is_valid and (get_d(r) >= cutoff or get_d(r) == 0) and not is_already_sent(ref):
-                addr = r.get('full_address') or r.get('ADDRESS') or r.get('LOCATION') or r.get('SITE_ADDRESS')
-                prop = ""
-                for k, v in r.items():
-                    if any(h in k.lower() for h in CABINET_HEADERS): prop = v; break
+                addr = r.get('full_address') or r.get('ADDRESS') or r.get('LOCATION') or r.get('SITE_ADDRESS') or "Address not provided"
+                prop = next((v for k, v in r.items() if any(h in k.lower() for h in CABINET_HEADERS)), "No description")
+                
                 try:
-                    ai = client.chat.completions.create(
-                        model="gpt-4o-mini", response_format={"type": "json_object"},
-                        messages=[{"role": "system", "content": "Return JSON: applicant_name, site_address, postcode, scope_summary, high_value (bool). Focus on tree work specifics."},
-                        {"role": "user", "content": f"Addr: {addr} Prop: {prop}"}]
+                    # AI Scoring and Summarization
+                    ai_res = client.chat.completions.create(
+                        model="gpt-4o-mini", 
+                        response_format={"type": "json_object"},
+                        messages=[{"role": "system", "content": "Return JSON: applicant_name, site_address, postcode, scope_summary, high_value (bool). Focus on tree removal vs maintenance."},
+                                  {"role": "user", "content": f"Address: {addr} Proposal: {prop}"}]
                     )
-                    ld = json.loads(ai.choices[0].message.content)
+                    ld = json.loads(ai_res.choices[0].message.content)
                 except: continue
+
+                # Targeting Surgeons (Fallback to test email)
                 surgeons = [{"id": 1, "email": T_EM}]
-                if SURL:
-                    try:
-                        db = psycopg2.connect(SURL); c = db.cursor()
-                        c.execute("SELECT id, email FROM tree_surgeons WHERE active IS TRUE")
-                        surgeons = [{"id": row[0], "email": row[1]} for row in c.fetchall()] or surgeons
-                        db.close()
-                    except: pass
+                # If Supabase is connected, fetch active surgeons here
+
                 for sgn in surgeons:
-                    amt = 6000 if ld.get("high_value") else 3500
+                    price = 6000 if ld.get("high_value") else 3500
                     checkout = stripe.checkout.Session.create(
                         payment_method_types=["card"],
-                        line_items=[{"price_data": {"currency": "gbp", "product_data": {"name": f"Lead: {ld.get('site_address')}"}, "unit_amount": amt}, "quantity": 1}],
-                        mode="payment", success_url=f"{P_URL}/payment-success", cancel_url=f"{P_URL}/payment-cancelled",
-                        metadata={"surgeon_id": str(sgn["id"]), "ref": ref, "site_address": ld.get("site_address")}
+                        line_items=[{"price_data": {"currency": "gbp", "product_data": {"name": f"Lead: {ld.get('site_address')}"}, "unit_amount": price}, "quantity": 1}],
+                        mode="payment", 
+                        success_url=f"{P_URL}/payment-success", 
+                        cancel_url=f"{P_URL}/payment-cancelled"
                     )
-                    email_html = f"<h2>New Tree Lead: {c_name}</h2><p>{ld.get('scope_summary')}</p><a href='{checkout.url}'>Purchase Lead</a>"
-                    requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [sgn["email"]], "subject": f"Lead: {ld.get('site_address')}", "html": email_html}, headers={"Authorization": f"Bearer {R_KEY}"})
+
+                    # Dispatch via Resend
+                    email_html = f"<h2>New Lead: {c_name}</h2><p>{ld.get('scope_summary')}</p><a href='{checkout.url}'>Purchase Lead</a>"
+                    requests.post(R_URL, json={
+                        "from": "Vector Data Labs <onboarding@resend.dev>",
+                        "to": [sgn["email"]],
+                        "subject": f"New Lead: {ld.get('site_address')}",
+                        "html": email_html
+                    }, headers={"Authorization": f"Bearer {R_KEY}"})
+
                 mark_as_sent(ref)
                 leads_sent += 1
                 if leads_sent >= 10: break
+
     return {"status": "success", "leads_sent": leads_sent}
 
-@app.get("/payment-success", include_in_schema=False)
-def success(): return HTMLResponse("<h1>Success!</h1>")
+@app.get("/payment-success")
+def success(): return HTMLResponse("<h1>Payment Successful</h1>")
 
-@app.get("/payment-cancelled", include_in_schema=False)
-def cancel(): return HTMLResponse("<h1>Cancelled</h1>")
+@app.get("/payment-cancelled")
+def cancel(): return HTMLResponse("<h1>Payment Cancelled</h1>")
