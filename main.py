@@ -1,4 +1,4 @@
-import os, json, logging, requests, psycopg2, stripe, urllib3
+import os, json, logging, requests, psycopg2, stripe, urllib3, re
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import HTMLResponse
@@ -7,7 +7,7 @@ from openai import OpenAI
 # Disable SSL warnings for internal council certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="Vector Data Labs - V16.3 Master", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs - V16.4 Master", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
@@ -22,31 +22,30 @@ client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# --- THE MASTER LIST (V16.3 Path Normalization) ---
-# We use the 'Root' service names which are the most stable during infrastructure migrations.
+# --- THE MASTER LIST (Self-Healing Roots) ---
 COUNCILS = {
     "Leeds_Control": {
         "url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query",
         "referer": "https://www.leeds.gov.uk/"
     },
     "London_Mega_Hub": {
-        # Normalized to the root 'Planning' path for the S96p cluster
-        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning/FeatureServer/0/query",
+        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_London_Datahub/FeatureServer/0/query",
+        "root": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services",
         "referer": "https://www.london.gov.uk/"
     },
     "Richmond_Wandsworth": {
-        # Reverting to the primary shared service name
         "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications/FeatureServer/0/query",
+        "root": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services",
         "referer": "https://www.wandsworth.gov.uk/"
     },
     "Woking_Surrey": {
-        # Using the standardized borough specific suffix
         "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications_Woking/FeatureServer/0/query",
+        "root": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services",
         "referer": "https://www.woking.gov.uk/"
     },
     "Croydon_Direct": {
-        # Updated URL and Referer to mimic the exact official portal origin
         "url": "https://maps.croydon.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
+        "root": "https://maps.croydon.gov.uk/arcgis/rest/services",
         "referer": "https://maps.croydon.gov.uk/planning/index.html"
     }
 }
@@ -69,41 +68,60 @@ def classify(r):
     matches = [k for k in TREE_WORDS if k in p]
     score = len(matches)
     if "tree" in p: score += 2
-    if any(x in p for x in ["fell", "remove", "crown", "tpo"]): score += 5
+    if any(x in p for x in ["fell", "remove", "crown", "tpo", "conservation area"]): score += 5
     if any(w in p for w in SKIP_WORDS) and score < 8: return False, 0
     return (score > 2), score
 
-# --- FETCHING LOGIC (Origin Spoofing V16.3) ---
+# --- FETCHING LOGIC (Self-Healing Discovery) ---
 def fetch_council(name, config):
-    url = config["url"]
     h = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-GB,en;q=0.9",
         "Referer": config["referer"],
-        "Origin": config["referer"].split("/planning")[0], # Dynamic origin spoofing
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "cross-site",
+        "Sec-Ch-Ua": '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
         "Connection": "keep-alive"
     }
     q = {"where": "1=1", "outFields": "*", "resultRecordCount": 50, "orderByFields": "OBJECTID DESC", "f": "json"}
+    
+    # 1. Try Primary URL
     try:
-        res = requests.get(url, params=q, headers=h, timeout=30, verify=False)
-        if res.status_code == 404: return [], "Path Rotated (404)"
-        if res.status_code != 200: return [], f"HTTP {res.status_code} Error"
-        
+        res = requests.get(config["url"], params=q, headers=h, timeout=20, verify=False)
+        if res.status_code == 200 and "features" in res.text:
+            return [f.get("attributes", {}) for f in res.json().get("features", [])], "Success"
+    except:
+        pass
+
+    # 2. Self-Healing Discovery (If root is provided)
+    if "root" in config:
         try:
-            data = res.json()
-        except:
-            return [], "HTML Firewall Blocked (Access Denied)"
+            logger.info(f"Self-Healing triggered for {name}")
+            services_res = requests.get(f"{config['root']}?f=json", headers=h, timeout=15, verify=False)
+            services = services_res.json().get("services", [])
             
-        if "error" in data: return [], f"ArcGIS: {data['error'].get('message')}"
-        
-        features = data.get("features", [])
-        return [f.get("attributes", {}) for f in features], "Success"
-    except Exception as e:
-        return [], f"Fail: {str(e)}"
+            # Find the best match
+            best_service = None
+            for s in services:
+                sname = s.get("name", "").lower()
+                if "planning" in sname and "register" in sname:
+                    best_service = s.get("name")
+                    break
+                if "planning" in sname:
+                    best_service = s.get("name")
+            
+            if best_service:
+                stype = s.get("type", "MapServer")
+                discovery_url = f"{config['root']}/{best_service}/{stype}/0/query"
+                logger.info(f"Discovered new path for {name}: {discovery_url}")
+                res = requests.get(discovery_url, params=q, headers=h, timeout=20, verify=False)
+                if res.status_code == 200 and "features" in res.text:
+                    return [f.get("attributes", {}) for f in res.json().get("features", [])], f"Self-Healed: {best_service}"
+        except Exception as e:
+            return [], f"Discovery Fail: {str(e)}"
+
+    return [], "Status: Layer Hidden/Rotated"
 
 # --- DATABASE ---
 def is_already_sent(ref):
@@ -131,8 +149,8 @@ def lander():
     return f"""
     <html><body style='font-family:sans-serif;text-align:center;padding-top:50px; background:#f4f4f9;'>
     <div style='display:inline-block; padding:40px; background:white; border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,0.05); border-top: 5px solid #2e7d32;'>
-    <h1>Vector Data Labs V16.3</h1>
-    <p>Leeds: <b>ACTIVE</b> | London: <b>PATH NORMALIZATION</b></p>
+    <h1>Vector Data Labs V16.4</h1>
+    <p>Leeds: <b>ACTIVE</b> | London: <b>SELF-HEALING MODE</b></p>
     <hr style='border:0; border-top:1px solid #eee; margin:20px 0;'/>
     <a href='/test-regional' style='color:#2e7d32; text-decoration:none; font-weight:bold;'>Run Regional Health Check</a>
     </div>
@@ -192,12 +210,12 @@ def scrape(secret: str = Query(...)):
                         metadata={"surgeon_id": str(sgn["id"]), "ref": ref, "site_address": ld.get("site_address")}
                     )
                     email_html = f"""
-                    <div style='font-family:sans-serif; border-left: 8px solid #1a73e8; padding:20px; background:#f9f9f9;'>
-                    <h2 style='color:#1a73e8;'>New Tree Lead: {c_name}</h2>
+                    <div style='font-family:sans-serif; border-left: 8px solid #2e7d32; padding:20px; background:#f9f9f9;'>
+                    <h2 style='color:#2e7d32;'>New Tree Lead: {c_name}</h2>
                     <p><strong>Work:</strong> {ld.get('scope_summary')}</p>
                     <p><strong>Location:</strong> {ld.get('site_address')}</p>
                     <br/>
-                    <a href='{checkout.url}' style='background:#1a73e8; color:white; padding:15px 30px; text-decoration:none; border-radius:5px; font-weight:bold; display:inline-block;'>Buy Lead Details (£{amt/100})</a>
+                    <a href='{checkout.url}' style='background:#2e7d32; color:white; padding:15px 30px; text-decoration:none; border-radius:5px; font-weight:bold; display:inline-block;'>Buy Lead Details (£{amt/100})</a>
                     </div>
                     """
                     requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [sgn["email"]], "subject": f"Lead: {ld.get('site_address')}", "html": email_html}, headers={"Authorization": f"Bearer {R_KEY}"})
@@ -207,20 +225,6 @@ def scrape(secret: str = Query(...)):
                 if leads_sent >= 10: break
         if leads_sent >= 10: break
     return {"status": "success", "leads_sent": leads_sent}
-
-@app.post("/webhook", include_in_schema=False)
-async def webhook(req: Request):
-    sig, payload = req.headers.get("stripe-signature"), await req.body()
-    try:
-        event = stripe.Webhook.construct_event(payload, sig, S_WH)
-        if event["type"] == "checkout.session.completed":
-            sess = event["data"]["object"]
-            if sess["id"] not in _processed:
-                _processed.add(sess["id"])
-                m = sess["metadata"]
-                requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [T_EM], "subject": "   SALE!", "html": f"Paid: {m.get('site_address')}"}, headers={"Authorization": f"Bearer {R_KEY}"})
-    except: pass
-    return {"status": "ok"}
 
 @app.get("/payment-success")
 def success(): return HTMLResponse("<h1>Success!</h1>")
