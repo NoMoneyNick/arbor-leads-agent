@@ -4,10 +4,10 @@ from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from openai import OpenAI
 
-# Disable SSL warnings for internal council certs
+# Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="Vector Data Labs - V16.4 Master", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs - V16.5 Master", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
@@ -22,7 +22,7 @@ client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# --- THE MASTER LIST (Self-Healing Roots) ---
+# --- THE MASTER LIST (Deep Discovery Roots) ---
 COUNCILS = {
     "Leeds_Control": {
         "url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query",
@@ -46,7 +46,7 @@ COUNCILS = {
     "Croydon_Direct": {
         "url": "https://maps.croydon.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
         "root": "https://maps.croydon.gov.uk/arcgis/rest/services",
-        "referer": "https://maps.croydon.gov.uk/planning/index.html"
+        "referer": "https://www.croydon.gov.uk/"
     }
 }
 
@@ -72,52 +72,46 @@ def classify(r):
     if any(w in p for w in SKIP_WORDS) and score < 8: return False, 0
     return (score > 2), score
 
-# --- FETCHING LOGIC (Self-Healing Discovery) ---
+# --- FETCHING LOGIC (Recursive Discovery V16.5) ---
 def fetch_council(name, config):
     h = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-GB,en;q=0.9",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+        "Accept": "application/json",
         "Referer": config["referer"],
-        "Sec-Ch-Ua": '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Origin": config["referer"].rstrip('/'),
         "Connection": "keep-alive"
     }
     q = {"where": "1=1", "outFields": "*", "resultRecordCount": 50, "orderByFields": "OBJECTID DESC", "f": "json"}
     
-    # 1. Try Primary URL
+    # 1. Primary Attempt
     try:
         res = requests.get(config["url"], params=q, headers=h, timeout=20, verify=False)
         if res.status_code == 200 and "features" in res.text:
             return [f.get("attributes", {}) for f in res.json().get("features", [])], "Success"
-    except:
-        pass
+    except: pass
 
-    # 2. Self-Healing Discovery (If root is provided)
+    # 2. Intelligence Update: Recursive Layer Search
     if "root" in config:
         try:
-            logger.info(f"Self-Healing triggered for {name}")
+            logger.info(f"Stepping up discovery for {name}")
             services_res = requests.get(f"{config['root']}?f=json", headers=h, timeout=15, verify=False)
-            services = services_res.json().get("services", [])
+            if "application/json" not in services_res.headers.get("Content-Type", ""):
+                return [], "Firewall: Blocked (HTML Response)"
             
-            # Find the best match
-            best_service = None
+            services = services_res.json().get("services", [])
             for s in services:
                 sname = s.get("name", "").lower()
-                if "planning" in sname and "register" in sname:
-                    best_service = s.get("name")
-                    break
-                if "planning" in sname:
-                    best_service = s.get("name")
-            
-            if best_service:
-                stype = s.get("type", "MapServer")
-                discovery_url = f"{config['root']}/{best_service}/{stype}/0/query"
-                logger.info(f"Discovered new path for {name}: {discovery_url}")
-                res = requests.get(discovery_url, params=q, headers=h, timeout=20, verify=False)
-                if res.status_code == 200 and "features" in res.text:
-                    return [f.get("attributes", {}) for f in res.json().get("features", [])], f"Self-Healed: {best_service}"
+                # If we find a Planning or Register service, probe multiple layers (0-15)
+                if any(k in sname for k in ["planning", "register", "applications"]):
+                    stype = s.get("type", "MapServer")
+                    for layer_id in [0, 5, 12, 1, 2]: # Priority indices for UK councils
+                        probe_url = f"{config['root']}/{s.get('name')}/{stype}/{layer_id}/query"
+                        try:
+                            probe = requests.get(probe_url, params=q, headers=h, timeout=10, verify=False)
+                            if probe.status_code == 200 and "features" in probe.text:
+                                logger.info(f"Cracked {name} via Layer {layer_id}")
+                                return [f.get("attributes", {}) for f in probe.json().get("features", [])], f"Cracked: L{layer_id}"
+                        except: continue
         except Exception as e:
             return [], f"Discovery Fail: {str(e)}"
 
@@ -146,16 +140,7 @@ def mark_as_sent(ref):
 # --- ROUTES ---
 @app.get("/", response_class=HTMLResponse)
 def lander():
-    return f"""
-    <html><body style='font-family:sans-serif;text-align:center;padding-top:50px; background:#f4f4f9;'>
-    <div style='display:inline-block; padding:40px; background:white; border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,0.05); border-top: 5px solid #2e7d32;'>
-    <h1>Vector Data Labs V16.4</h1>
-    <p>Leeds: <b>ACTIVE</b> | London: <b>SELF-HEALING MODE</b></p>
-    <hr style='border:0; border-top:1px solid #eee; margin:20px 0;'/>
-    <a href='/test-regional' style='color:#2e7d32; text-decoration:none; font-weight:bold;'>Run Regional Health Check</a>
-    </div>
-    </body></html>
-    """
+    return f"<html><body style='font-family:sans-serif;text-align:center;padding-top:50px;'><h1>Vector Data Labs V16.5</h1><p>Leeds: <b>ACTIVE</b> | London: <b>RECURSIVE SEARCH</b></p><a href='/test-regional'>Diagnostics</a></body></html>"
 
 @app.get("/test-regional")
 def test_all():
@@ -210,12 +195,12 @@ def scrape(secret: str = Query(...)):
                         metadata={"surgeon_id": str(sgn["id"]), "ref": ref, "site_address": ld.get("site_address")}
                     )
                     email_html = f"""
-                    <div style='font-family:sans-serif; border-left: 8px solid #2e7d32; padding:20px; background:#f9f9f9;'>
-                    <h2 style='color:#2e7d32;'>New Tree Lead: {c_name}</h2>
+                    <div style='font-family:sans-serif; border-left: 8px solid #1a73e8; padding:20px; background:#f9f9f9;'>
+                    <h2 style='color:#1a73e8;'>New Tree Lead: {c_name}</h2>
                     <p><strong>Work:</strong> {ld.get('scope_summary')}</p>
                     <p><strong>Location:</strong> {ld.get('site_address')}</p>
                     <br/>
-                    <a href='{checkout.url}' style='background:#2e7d32; color:white; padding:15px 30px; text-decoration:none; border-radius:5px; font-weight:bold; display:inline-block;'>Buy Lead Details (£{amt/100})</a>
+                    <a href='{checkout.url}' style='background:#1a73e8; color:white; padding:15px 30px; text-decoration:none; border-radius:5px; font-weight:bold; display:inline-block;'>Buy Lead Details (£{amt/100})</a>
                     </div>
                     """
                     requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [sgn["email"]], "subject": f"Lead: {ld.get('site_address')}", "html": email_html}, headers={"Authorization": f"Bearer {R_KEY}"})
