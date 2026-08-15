@@ -6,7 +6,7 @@ from openai import OpenAI
 
 # Professional Stability Setup
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-app = FastAPI(title="Vector Data Labs - V35.0 Key Master", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs - V40.0 Discovery Master", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
@@ -15,48 +15,46 @@ OKEY, SURL = os.getenv("OPENAI_API_KEY"), os.getenv("SUPABASE_DB_URL")
 S_SEC, S_WH = os.getenv("STRIPE_SECRET_KEY"), os.getenv("STRIPE_WEBHOOK_SECRET")
 R_KEY, T_EM = os.getenv("RESEND_API_KEY"), os.getenv("TEST_EMAIL")
 T_SEC, P_URL = os.getenv("TRIGGER_SECRET"), os.getenv("PUBLIC_APP_URL")
-GLA_KEY = os.getenv("GLA_API_KEY") # Your 4fa7bca7... key
+GLA_KEY = os.getenv("GLA_API_KEY") # Your key: 4fa7bca7-07b0-4575-83bb-0b8ad4f21e97
 
 R_URL = "https://api.resend.com/emails"
 client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# --- THE MASTER DATA ARCHITECTURE (V35.0 Authenticated) ---
+# --- THE OFFICIAL DATA ARCHITECTURE (V40.0 Verified) ---
 COUNCILS = {
-    "Leeds_City_Baseline": {
+    "Leeds_City_Control": {
         "type": "arcgis",
         "url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query",
         "referer": "https://www.leeds.gov.uk/"
     },
     "London_Official_Hub": {
         "type": "ckan",
-        # Using the official 'Action' API to fix the 404
+        # Hitting the official 'Search Artery' on the Datastore floor plan you provided
         "url": "https://data.london.gov.uk/api/3/action/datastore_search",
-        # This is the Resource ID for the Planning London Datahub
+        # This is the unique 'Room Number' for the live Planning Hub
         "resource_id": "847f2b1a-3852-475a-bcaf-192a29792664",
         "params": {"limit": 100}
     },
-    "Surrey_Direct_Pipe": {
+    "Surrey_Shared_Hub": {
         "type": "arcgis",
-        # Bypassing discovery and hitting the absolute path directly
+        # Using the direct cloud pipe found in our borough discovery
         "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications_Woking/FeatureServer/0/query",
         "referer": "https://www.woking.gov.uk/"
     }
 }
 
-# --- HUMAN LOGIC: TREE-FIRST REFINEMENT ---
+# --- HUMAN LOGIC: TIERED REFINEMENT ---
+# Tier 1: Identify the column (The Cabinet)
 CABINET_HEADERS = ["proposal", "description", "development_description", "nature", "details", "PROPOSAL"]
-# Tier 1: The "Gold" Words (If these are here, it's a lead)
-TREE_GOLD = ["tree", "tpo", "fell", "felling", "arboriculture", "crown", "pruning", "stump"]
-# Tier 2: The "Context" Words (If these are here, it's the right cabinet)
+# Tier 2: Search for trees (The Gold)
+TREE_GOLD = ["tree", "tpo", "fell", "felling", "arboriculture", "crown", "pruning", "stump", "oak", "ash", "willow", "cedar"]
+# Tier 3: Search for context (The Right Room)
 PLANNING_CONTEXT = ["planning", "development", "construction", "extension", "works", "site"]
 
 def smart_classify(record):
-    """
-    Inverted Logic: Search for Trees first. 
-    If not found, search for Planning Context to validate the file.
-    """
+    """Tiered search logic using your human-guided perspective."""
     description = ""
     for key, value in record.items():
         if any(h in key.lower() for h in CABINET_HEADERS):
@@ -65,40 +63,41 @@ def smart_classify(record):
     
     if not description: return False, 0
 
-    # Step 1: Immediate Tree Check (The 'Gold' Net)
+    # Human Logic Layer 1: Search for Trees first
     tree_matches = [word for word in TREE_GOLD if word in description]
     if tree_matches:
         score = len(tree_matches) * 5
-        return (score >= 5), score
+        # High value indicators
+        if any(x in description for x in ["fell", "felling", "tpo"]): score += 15
+        return (score >= 10), score
 
-    # Step 2: Context Check (Are we in the right cabinet but no trees?)
+    # Human Logic Layer 2: Context Check (Are we looking at the right file?)
     if any(word in description for word in PLANNING_CONTEXT):
-        return False, 0 # Valid planning app, but not a tree lead
+        # We are in the right room, but this isn't a tree lead
+        return False, 0
 
     return False, 0
 
 def get_d(r):
-    # DataPress/CKAN uses 'received_date', ArcGIS uses 'DATE_RECEIVED'
+    # Standardizes Date Strings (London API) and Timestamps (ArcGIS)
     v = r.get("received_date") or r.get("DATE_RECEIVED") or r.get("DATE_VALID") or 0
     if isinstance(v, str):
         try: return datetime.fromisoformat(v.replace('Z', '+00:00')).timestamp() * 1000
         except: return 0
     return float(v)
 
-# --- THE DATA RETRIEVAL ENGINE (V35.0) ---
+# --- THE AUTHORIZED DATA ENGINE (V40.0) ---
 def fetch_council(name, config):
     session = requests.Session()
     h = {
-        "User-Agent": "VectorDataLabs/35.0 (Business Data Integration; contact: admin@vectordata.labs)",
+        "User-Agent": "VectorDataLabs/40.0 (Professional Data Integration; contact: admin@vectordata.labs)",
         "Accept": "application/json"
     }
     
-    # Use your Key for the London building
-    if config["type"] == "ckan" and GLA_KEY:
-        h["Authorization"] = GLA_KEY 
-
     try:
         if config["type"] == "ckan":
+            # Using your 'Key to the Building' to authenticate
+            if GLA_KEY: h["Authorization"] = GLA_KEY 
             params = {**config["params"], "resource_id": config["resource_id"]}
             res = session.get(config["url"], params=params, headers=h, timeout=30)
             if res.status_code == 200:
@@ -117,7 +116,7 @@ def fetch_council(name, config):
         return [], f"Fault: {str(e)}"
     return [], "Offline"
 
-# --- DATABASE & WEBHOOKS (Preserved) ---
+# --- DATABASE & WEBHOOKS (Preserved Core) ---
 def is_already_sent(ref):
     if not SURL: return False
     try:
@@ -144,10 +143,10 @@ def lander():
     <html><body style='font-family:sans-serif; text-align:center; padding-top:50px; background:#f4f4f9;'>
     <div style='display:inline-block; padding:50px; background:white; border-radius:15px; box-shadow:0 10px 30px rgba(0,0,0,0.1); border-top: 6px solid #1b5e20; max-width:600px;'>
     <h1 style='color:#1b5e20;'>Vector Data Labs</h1>
-    <p>Official Developer Integration Hub V35.0</p>
+    <p>Official Developer Integration Hub V40.0</p>
     <div style='background:#f1f8e9; padding:15px; border-radius:10px; margin:20px 0; text-align:left; font-size:14px;'>
-    <b>Status:</b> Leeds/Surrey Artery Online | London Hub Authenticated.<br/>
-    <b>Logic:</b> Tree-First Refinement (Bypassing noisy construction).
+    <b>Status:</b> Leeds Control Active | London Datastore Authenticated.<br/>
+    <b>Logic:</b> Tiered Refinement (Tree-First Discovery).
     </div>
     <a href='/test-regional' style='display:inline-block; padding:12px 25px; background:#1b5e20; color:white; text-decoration:none; border-radius:5px; font-weight:bold;'>Check Live Leads Feed</a>
     </div>
@@ -171,10 +170,10 @@ def scrape(secret: str = Query(...)):
     for c_name, config in COUNCILS.items():
         recs, _ = fetch_council(c_name, config)
         for r in recs:
-            # Smart Reference Key detection
+            # Smart Reference Detection
             ref = str(r.get("external_system_reference") or r.get("REFERENCE") or r.get("_id") or r.get("OBJECTID"))
             is_valid, _ = smart_classify(r)
-            if is_valid and not is_already_sent(ref):
+            if is_valid and (get_d(r) >= cutoff or get_d(r) == 0) and not is_already_sent(ref):
                 addr = r.get('full_address') or r.get('ADDRESS') or r.get('LOCATION') or r.get('SITE_ADDRESS')
                 prop = ""
                 for k, v in r.items():
@@ -209,3 +208,9 @@ def scrape(secret: str = Query(...)):
                 leads_sent += 1
                 if leads_sent >= 10: break
     return {"status": "success", "leads_sent": leads_sent}
+
+@app.get("/payment-success", include_in_schema=False)
+def success(): return HTMLResponse("<h1>Success!</h1>")
+
+@app.get("/payment-cancelled", include_in_schema=False)
+def cancel(): return HTMLResponse("<h1>Cancelled</h1>")
