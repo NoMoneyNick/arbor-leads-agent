@@ -1,4 +1,4 @@
-import os, json, logging, requests, psycopg2, stripe, urllib3, time
+import os, json, logging, requests, psycopg2, stripe, urllib3
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import HTMLResponse
@@ -7,7 +7,7 @@ from openai import OpenAI
 # Disable SSL warnings for internal council certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="Vector Data Labs - V22.1 Discovery Master", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs - V23.0 Official Master", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
@@ -22,106 +22,95 @@ client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# --- THE MASTER CRAWL LIST (August 2024 Verified) ---
+# --- THE MASTER DATA ARCHITECTURE (V23.0) ---
 COUNCILS = {
     "Leeds_Control": {
-        "type": "direct",
+        "type": "arcgis_static",
         "url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query",
         "referer": "https://www.leeds.gov.uk/"
     },
-    "London_Mega_Hub": {
-        "type": "handshake",
-        "root": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services",
-        "candidates": ["Planning_London_Datahub", "Planning_Applications"],
-        "home": "https://www.london.gov.uk/what-we-do/planning/planning-london-datahub",
-        "referer": "https://www.london.gov.uk/"
+    "London_Official_Hub": {
+        "type": "gla_rest",
+        # This official API aggregates all 32 London Boroughs (including Croydon)
+        "url": "https://data.london.gov.uk/api/planning/v1/applications/",
+        "params": {"page_size": 100}
     },
-    "Croydon_Direct": {
-        "type": "handshake",
-        "root": "https://maps.croydon.gov.uk/arcgis/rest/services/Planning",
-        "candidates": ["Planning_Applications", "Planning_Register"],
-        "home": "https://www.croydon.gov.uk/planning-and-regeneration/planning/view-planning-applications",
-        "referer": "https://www.croydon.gov.uk/"
-    },
-    "Woking_Surrey": {
-        "type": "handshake",
+    "Surrey_Cloud_Cluster": {
+        "type": "arcgis_discovery",
         "root": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services",
-        "candidates": ["Planning_Applications_Woking", "Woking_Planning"],
-        "home": "https://www.woking.gov.uk/planning/planning-applications/search-planning-applications",
         "referer": "https://www.woking.gov.uk/"
     }
 }
 
 # --- LOGIC: CLASSIFICATION ---
-TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "stump", "arboriculture", "oak", "ash", "cedar", "conifer", "birch", "maple", "willow", "sycamore"]
+TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "stump", "arboriculture", "oak", "ash", "cedar", "conifer", "birch", "maple", "willow", "sycamore", "poplar"]
 SKIP_WORDS = ["dwelling", "erection of", "new build", "extension", "loft conversion", "demolition"]
 
 def get_d(r):
-    v = r.get("DATE_RECEIVED") or r.get("DATE_VALID") or r.get("DATEAPVAL") or r.get("RECDAT") or 0
-    try: return float(v)
-    except: return 0
+    # Standardizes Date Strings (London) and Timestamps (Leeds/Surrey)
+    v = r.get("received_date") or r.get("DATE_RECEIVED") or r.get("DATE_VALID") or r.get("DATEAPVAL") or 0
+    if isinstance(v, str):
+        try: return datetime.fromisoformat(v.replace('Z', '+00:00')).timestamp() * 1000
+        except: return 0
+    return float(v)
 
 def classify(r):
+    # Field mapping for diverse API schemas
     p = str(r.get("development_description") or r.get("PROPOSAL") or r.get("DESCRIPTION") or r.get("DESCRIPT") or "").lower()
     if not p: return False, 0
+    
     matches = [k for k in TREE_WORDS if k in p]
     score = len(matches)
     if "tree" in p: score += 2
     if any(x in p for x in ["fell", "remove", "crown", "tpo", "conservation area"]): score += 5
+    
+    # Negative filtering to keep lead quality high
     if any(w in p for w in SKIP_WORDS) and score < 8: return False, 0
     return (score > 2), score
 
-# --- THE HANDSHAKE ENGINE (V22.1) ---
+# --- THE DATA RETRIEVAL ENGINE ---
 def fetch_council(name, config):
     session = requests.Session()
-    # High-Entropy Headers to pass modern WAFs
     h = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-GB,en;q=0.9",
-        "Referer": config["referer"],
-        "Sec-Ch-Ua": '"Not)A;Brand";v="99", "Google Chrome";v="127", "Chromium";v="127"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"macOS"',
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin"
+        "User-Agent": "VectorDataLabs/23.0 (Official Data Integration)",
+        "Accept": "application/json",
+        "Referer": config.get("referer", "https://www.google.com")
     }
-    q = {"where": "1=1", "outFields": "*", "resultRecordCount": 50, "orderByFields": "OBJECTID DESC", "f": "json"}
-
-    # Track 1: Direct (Leeds)
-    if config["type"] == "direct":
-        try:
+    
+    try:
+        # TRACK 1: Official London GLA API
+        if config["type"] == "gla_rest":
+            res = session.get(config["url"], params=config["params"], headers=h, timeout=30)
+            if res.status_code == 200:
+                return res.json().get("results", []), "Online (Official API)"
+        
+        # TRACK 2: Leeds Static ArcGIS
+        elif config["type"] == "arcgis_static":
+            q = {"where": "1=1", "outFields": "*", "resultRecordCount": 100, "orderByFields": "OBJECTID DESC", "f": "json"}
             res = session.get(config["url"], params=q, headers=h, timeout=20, verify=False)
             if res.status_code == 200:
-                return [f.get("attributes", {}) for f in res.json().get("features", [])], "Success"
-        except: pass
+                return [f.get("attributes", {}) for f in res.json().get("features", [])], "Online"
 
-    # Track 2: Handshake Discovery (London/Surrey)
-    if config["type"] == "handshake":
-        try:
-            # Step A: Perform the Handshake (Visit homepage first)
-            logger.info(f"Handshake started for {name} via {config['home']}")
-            session.get(config["home"], headers=h, timeout=15, verify=False)
-            
-            # Step B: Probe candidates directly (Directory is likely hidden)
-            for service in config["candidates"]:
-                for s_type in ["FeatureServer", "MapServer"]:
-                    for l_id in [0, 5, 1, 12]:
-                        target_url = f"{config['root']}/{service}/{s_type}/{l_id}/query"
-                        try:
-                            res = session.get(target_url, params=q, headers=h, timeout=12, verify=False)
-                            if res.status_code == 200 and "features" in res.text:
-                                features = res.json().get("features", [])
-                                if len(features) > 0:
-                                    return [f.get("attributes", {}) for f in features], f"Cracked: {service} (L{l_id})"
-                        except: continue
-        except Exception as e:
-            return [], f"Handshake Fail: {str(e)}"
+        # TRACK 3: Surrey Discovery (Self-Healing)
+        elif config["type"] == "arcgis_discovery":
+            # Ask the server for the building directory
+            dir_res = session.get(f"{config['root']}?f=json", headers=h, timeout=15, verify=False)
+            services = dir_res.json().get("services", [])
+            # Find the Surrey planning service
+            for s in services:
+                if "Woking" in s['name'] or "Surrey" in s['name'] or "Planning" in s['name']:
+                    query_url = f"{config['root']}/{s['name']}/{s['type']}/0/query"
+                    q = {"where": "1=1", "outFields": "*", "resultRecordCount": 50, "f": "json"}
+                    res = session.get(query_url, params=q, headers=h, timeout=15, verify=False)
+                    if res.status_code == 200:
+                        return [f.get("attributes", {}) for f in res.json().get("features", [])], f"Found: {s['name']}"
 
-    return [], "Offline/Rotated (Final)"
+    except Exception as e:
+        return [], f"Connection Fault: {str(e)}"
+    
+    return [], "Offline/Restricted"
 
-# --- DATABASE & ROUTES (Preserved Logic) ---
+# --- DATABASE OPERATIONS ---
 def is_already_sent(ref):
     if not SURL: return False
     try:
@@ -141,15 +130,16 @@ def mark_as_sent(ref):
         conn.commit(); conn.close()
     except: pass
 
+# --- ROUTES ---
 @app.get("/", response_class=HTMLResponse)
 def lander():
     return f"""
-    <html><body style='font-family:sans-serif; text-align:center; padding-top:50px; background:#f4f4f9;'>
-    <div style='display:inline-block; padding:40px; background:white; border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,0.05); border-top: 5px solid #1b5e20;'>
-    <h1>Vector Data Labs V22.1</h1>
-    <p>Leeds Baseline: <b>ACTIVE</b> | Discovery Engine: <b>HANDSHAKE ENABLED</b></p>
+    <html><body style='font-family:sans-serif; text-align:center; padding-top:50px; background:#fafafa;'>
+    <div style='display:inline-block; padding:40px; background:white; border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,0.05); border-top: 5px solid #2e7d32;'>
+    <h1>Vector Data Labs V23.0</h1>
+    <p>Status: <b> Leeds Control Active </b> | London Hub: <b> OFFICIAL API </b></p>
     <hr style='border:0; border-top:1px solid #eee; margin:20px 0;'/>
-    <a href='/test-regional' style='color:#1b5e20; text-decoration:none; font-weight:bold;'>Run Full Persistence Health Check</a>
+    <a href='/test-regional' style='color:#2e7d32; text-decoration:none; font-weight:bold;'>Run Full System Diagnostic</a>
     </div>
     </body></html>
     """
@@ -168,22 +158,30 @@ def scrape(secret: str = Query(...)):
     if secret != T_SEC: raise HTTPException(status_code=401)
     leads_sent = 0
     cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).timestamp() * 1000
+    
     for c_name, config in COUNCILS.items():
         recs, _ = fetch_council(c_name, config)
         for r in recs:
-            ref = str(r.get("REFERENCE") or r.get("PLANNO") or r.get("REFVAL") or r.get("OBJECTID"))
+            # Smart Reference ID (handles multiple API formats)
+            ref = str(r.get("external_system_reference") or r.get("REFERENCE") or r.get("OBJECTID"))
             is_valid, _ = classify(r)
+            
             if is_valid and (get_d(r) >= cutoff or get_d(r) == 0) and not is_already_sent(ref):
-                addr = r.get('full_address') or r.get('ADDRESS') or r.get('LOCATION') or r.get('SITE_ADDRESS')
+                addr = r.get('full_address') or r.get('ADDRESS') or r.get('LOCATION')
                 prop = r.get('development_description') or r.get('PROPOSAL') or r.get('DESCRIPTION')
+                
                 try:
                     ai = client.chat.completions.create(
-                        model="gpt-4o-mini", response_format={"type": "json_object"},
-                        messages=[{"role": "system", "content": "Return JSON: applicant_name, site_address, postcode, scope_summary, high_value (bool)."},
-                        {"role": "user", "content": f"Addr: {addr} Prop: {prop}"}]
+                        model="gpt-4o-mini", 
+                        response_format={"type": "json_object"},
+                        messages=[
+                            {"role": "system", "content": "Return JSON: applicant_name, site_address, postcode, scope_summary, high_value (bool)."},
+                            {"role": "user", "content": f"Addr: {addr} Prop: {prop}"}
+                        ]
                     )
                     ld = json.loads(ai.choices[0].message.content)
                 except: continue
+
                 surgeons = [{"id": 1, "email": T_EM}]
                 if SURL:
                     try:
@@ -192,17 +190,19 @@ def scrape(secret: str = Query(...)):
                         surgeons = [{"id": row[0], "email": row[1]} for row in c.fetchall()] or surgeons
                         db.close()
                     except: pass
+
                 for sgn in surgeons:
+                    # Professional London Pricing: £35 / £60
                     amt = 6000 if ld.get("high_value") else 3500
                     checkout = stripe.checkout.Session.create(
                         payment_method_types=["card"],
                         line_items=[{"price_data": {"currency": "gbp", "product_data": {"name": f"Lead: {ld.get('site_address')}"}, "unit_amount": amt}, "quantity": 1}],
-                        mode="payment", success_url=f"{P_URL}/payment-success",
-                        cancel_url=f"{P_URL}/payment-cancelled",
+                        mode="payment", success_url=f"{P_URL}/payment-success", cancel_url=f"{P_URL}/payment-cancelled",
                         metadata={"surgeon_id": str(sgn["id"]), "ref": ref, "site_address": ld.get("site_address")}
                     )
-                    email_html = f"<h2>New Lead: {c_name}</h2><p>{ld.get('scope_summary')}</p><a href='{checkout.url}'>Purchase Lead</a>"
+                    email_html = f"<h2>New Tree Lead: {c_name}</h2><p>{ld.get('scope_summary')}</p><a href='{checkout.url}'>Purchase Lead Details</a>"
                     requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [sgn["email"]], "subject": f"Lead: {ld.get('site_address')}", "html": email_html}, headers={"Authorization": f"Bearer {R_KEY}"})
+                
                 mark_as_sent(ref)
                 leads_sent += 1
                 if leads_sent >= 10: break
