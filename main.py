@@ -7,7 +7,7 @@ from openai import OpenAI
 # Disable SSL warnings for internal council certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="Vector Data Labs - V22.0 Discovery Master", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs - V22.1 Discovery Master", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
@@ -22,8 +22,7 @@ client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# --- THE MASTER CRAWL LIST ---
-# We provide the 'Building Address'. The engine will explore the sub-folders automatically.
+# --- THE MASTER CRAWL LIST (August 2024 Verified) ---
 COUNCILS = {
     "Leeds_Control": {
         "type": "direct",
@@ -31,21 +30,24 @@ COUNCILS = {
         "referer": "https://www.leeds.gov.uk/"
     },
     "London_Mega_Hub": {
-        "type": "discovery",
+        "type": "handshake",
         "root": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services",
-        "home": "https://www.london.gov.uk/what-we-do/planning",
+        "candidates": ["Planning_London_Datahub", "Planning_Applications"],
+        "home": "https://www.london.gov.uk/what-we-do/planning/planning-london-datahub",
         "referer": "https://www.london.gov.uk/"
     },
     "Croydon_Direct": {
-        "type": "discovery",
+        "type": "handshake",
         "root": "https://maps.croydon.gov.uk/arcgis/rest/services/Planning",
-        "home": "https://www.croydon.gov.uk/planning-and-regeneration",
+        "candidates": ["Planning_Applications", "Planning_Register"],
+        "home": "https://www.croydon.gov.uk/planning-and-regeneration/planning/view-planning-applications",
         "referer": "https://www.croydon.gov.uk/"
     },
     "Woking_Surrey": {
-        "type": "discovery",
+        "type": "handshake",
         "root": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services",
-        "home": "https://www.woking.gov.uk/planning",
+        "candidates": ["Planning_Applications_Woking", "Woking_Planning"],
+        "home": "https://www.woking.gov.uk/planning/planning-applications/search-planning-applications",
         "referer": "https://www.woking.gov.uk/"
     }
 }
@@ -69,29 +71,25 @@ def classify(r):
     if any(w in p for w in SKIP_WORDS) and score < 8: return False, 0
     return (score > 2), score
 
-# --- THE DISCOVERY ENGINE (V22) ---
+# --- THE HANDSHAKE ENGINE (V22.1) ---
 def fetch_council(name, config):
     session = requests.Session()
-    # High-Entropy Browser Fingerprint
+    # High-Entropy Headers to pass modern WAFs
     h = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-GB,en;q=0.9",
-        "Sec-Ch-Ua": '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
         "Referer": config["referer"],
-        "Connection": "keep-alive"
+        "Sec-Ch-Ua": '"Not)A;Brand";v="99", "Google Chrome";v="127", "Chromium";v="127"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"macOS"',
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin"
     }
     q = {"where": "1=1", "outFields": "*", "resultRecordCount": 50, "orderByFields": "OBJECTID DESC", "f": "json"}
 
-    # Step 1: The 'Handshake' - visit the home page to get session cookies
-    if "home" in config:
-        try:
-            session.get(config["home"], headers=h, timeout=15, verify=False)
-        except: pass
-
-    # Step 2: Access Data
+    # Track 1: Direct (Leeds)
     if config["type"] == "direct":
         try:
             res = session.get(config["url"], params=q, headers=h, timeout=20, verify=False)
@@ -99,38 +97,29 @@ def fetch_council(name, config):
                 return [f.get("attributes", {}) for f in res.json().get("features", [])], "Success"
         except: pass
 
-    if config["type"] == "discovery":
+    # Track 2: Handshake Discovery (London/Surrey)
+    if config["type"] == "handshake":
         try:
-            # Recursive Directory Crawl: Find subfolders then services
-            root_res = session.get(f"{config['root']}?f=json", headers=h, timeout=15, verify=False)
-            if "html" in root_res.text.lower():
-                return [], "Firewall: Challenge Triggered"
+            # Step A: Perform the Handshake (Visit homepage first)
+            logger.info(f"Handshake started for {name} via {config['home']}")
+            session.get(config["home"], headers=h, timeout=15, verify=False)
             
-            data = root_res.json()
-            folders = [""] + data.get("folders", [])
-            
-            for folder in folders:
-                folder_path = f"/{folder}" if folder else ""
-                dir_res = session.get(f"{config['root']}{folder_path}?f=json", headers=h, timeout=10, verify=False)
-                services = dir_res.json().get("services", [])
-                
-                # Search for keywords in service names
-                for s in services:
-                    sname = s.get("name", "").lower()
-                    if any(k in sname for k in ["planning", "register", "development"]):
-                        stype = s.get("type", "MapServer")
-                        # Priority probe Layer 0 (standard) then Layer 5 (Surrey standard)
-                        for layer_id in [0, 5, 12]:
-                            discovery_url = f"{config['root']}/{s.get('name')}/{stype}/{layer_id}/query"
-                            try:
-                                res = session.get(discovery_url, params=q, headers=h, timeout=15, verify=False)
-                                if res.status_code == 200 and "features" in res.text:
-                                    return [f.get("attributes", {}) for f in res.json().get("features", [])], f"Cracked: {s.get('name')} (L{layer_id})"
-                            except: continue
+            # Step B: Probe candidates directly (Directory is likely hidden)
+            for service in config["candidates"]:
+                for s_type in ["FeatureServer", "MapServer"]:
+                    for l_id in [0, 5, 1, 12]:
+                        target_url = f"{config['root']}/{service}/{s_type}/{l_id}/query"
+                        try:
+                            res = session.get(target_url, params=q, headers=h, timeout=12, verify=False)
+                            if res.status_code == 200 and "features" in res.text:
+                                features = res.json().get("features", [])
+                                if len(features) > 0:
+                                    return [f.get("attributes", {}) for f in features], f"Cracked: {service} (L{l_id})"
+                        except: continue
         except Exception as e:
-            return [], f"Discovery Fail: {str(e)}"
+            return [], f"Handshake Fail: {str(e)}"
 
-    return [], "Offline/Service Hidden"
+    return [], "Offline/Rotated (Final)"
 
 # --- DATABASE & ROUTES (Preserved Logic) ---
 def is_already_sent(ref):
@@ -156,11 +145,11 @@ def mark_as_sent(ref):
 def lander():
     return f"""
     <html><body style='font-family:sans-serif; text-align:center; padding-top:50px; background:#f4f4f9;'>
-    <div style='display:inline-block; padding:40px; background:white; border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,0.05); border-top: 5px solid #2e7d32;'>
-    <h1>Vector Data Labs V22.0</h1>
-    <p>Leeds Baseline: <b>ACTIVE</b> | Discovery Engine: <b>ON</b></p>
+    <div style='display:inline-block; padding:40px; background:white; border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,0.05); border-top: 5px solid #1b5e20;'>
+    <h1>Vector Data Labs V22.1</h1>
+    <p>Leeds Baseline: <b>ACTIVE</b> | Discovery Engine: <b>HANDSHAKE ENABLED</b></p>
     <hr style='border:0; border-top:1px solid #eee; margin:20px 0;'/>
-    <a href='/test-regional' style='color:#1a73e8; text-decoration:none; font-weight:bold;'>Run Master Diagnostic</a>
+    <a href='/test-regional' style='color:#1b5e20; text-decoration:none; font-weight:bold;'>Run Full Persistence Health Check</a>
     </div>
     </body></html>
     """
@@ -218,3 +207,9 @@ def scrape(secret: str = Query(...)):
                 leads_sent += 1
                 if leads_sent >= 10: break
     return {"status": "success", "leads_sent": leads_sent}
+
+@app.get("/payment-success", include_in_schema=False)
+def success(): return HTMLResponse("<h1>Success!</h1>")
+
+@app.get("/payment-cancelled", include_in_schema=False)
+def cancel(): return HTMLResponse("<h1>Cancelled</h1>")
