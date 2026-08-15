@@ -4,10 +4,10 @@ from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from openai import OpenAI
 
-# Disable SSL warnings for internal council certs
+# Disable SSL warnings for councils using internal/self-signed certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="Vector Data Labs - V14.3 Master", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs - V15.0 Master", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
@@ -22,34 +22,29 @@ client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# --- THE MASTER LIST (V14.3 Deep Discovery) ---
+# --- THE MASTER LIST (V15.0 Mobile Breakthrough) ---
+# We target the 'Live' and 'Public' FeatureServer layers which are the most stable
 COUNCILS = {
     "Leeds_Control": {
-        "type": "arcgis",
         "url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query",
         "referer": "https://www.leeds.gov.uk/"
     },
     "London_Mega_Hub": {
-        "type": "arcgis",
-        # Using the absolute verified path for the consolidated GLA feed
         "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_London_Datahub/FeatureServer/0/query",
         "referer": "https://www.london.gov.uk/"
     },
     "Woking_Surrey": {
-        "type": "arcgis",
-        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications_Woking/FeatureServer/0/query",
+        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications_Live/FeatureServer/0/query",
         "referer": "https://www.woking.gov.uk/"
     },
-    "Hillingdon_London": {
-        "type": "arcgis",
-        # Shifting to their dedicated mapping subdomain which is more stable
-        "url": "https://maps.hillingdon.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
-        "referer": "https://www.hillingdon.gov.uk/"
-    },
     "Croydon_Direct": {
-        "type": "arcgis",
         "url": "https://maps.croydon.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
         "referer": "https://www.croydon.gov.uk/"
+    },
+    "Barnet_London": {
+        # Barnet is a high-volume borough and often more stable than Hillingdon
+        "url": "https://maps.barnet.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
+        "referer": "https://www.barnet.gov.uk/"
     }
 }
 
@@ -58,7 +53,7 @@ TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "st
 SKIP_WORDS = ["dwelling", "erection of", "new build", "extension", "loft conversion", "demolition"]
 
 def get_d(r):
-    v = r.get("DATE_RECEIVED") or r.get("received_date") or r.get("DATE_VALID") or r.get("DATEAPVAL") or 0
+    v = r.get("DATE_RECEIVED") or r.get("DATE_VALID") or r.get("DATEAPVAL") or r.get("RECDAT") or r.get("received_date") or 0
     if isinstance(v, str):
         try: return datetime.fromisoformat(v.replace('Z', '+00:00')).timestamp() * 1000
         except: return 0
@@ -72,14 +67,17 @@ def classify(r):
     matches = [k for k in TREE_WORDS if k in p]
     score = len(matches)
     if "tree" in p: score += 2
-    if any(x in p for x in ["fell", "remove", "crown", "tpo"]): score += 5
+    if any(x in p for x in ["fell", "remove", "crown", "tpo", "conservation area"]): score += 5
+    # Strict London filtering: No house extensions unless they are massive tree jobs
     if any(w in p for w in SKIP_WORDS) and score < 8: return False, 0
     return (score > 2), score
 
-# --- FETCHING LOGIC (With Stealth Armor) ---
+# --- FETCHING LOGIC (Mobile Mask V15) ---
 def fetch_council(name, config):
+    url = config["url"]
+    # iPhone 15 Safari Mask to bypass WAF/Firewalls
     h = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
         "Accept": "application/json, text/plain, */*",
         "Referer": config["referer"],
         "Accept-Language": "en-GB,en;q=0.9",
@@ -93,18 +91,19 @@ def fetch_council(name, config):
         "f": "json"
     }
     try:
-        res = requests.get(config["url"], params=q, headers=h, timeout=25, verify=False)
+        res = requests.get(url, params=q, headers=h, timeout=25, verify=False)
         if res.status_code != 200: return [], f"HTTP {res.status_code} Error"
         
-        # Check if we got JSON or a Firewall Block Page
+        # Check for HTML Firewall Response
+        if "<html>" in res.text.lower():
+            return [], "Firewall Blocked (Access Denied)"
+            
         try:
             data = res.json()
         except:
-            if "<html>" in res.text.lower():
-                return [], "Firewall Blocked (Access Denied)"
             return [], "Invalid JSON Response"
             
-        if "error" in data: return [], f"ArcGIS: {data['error'].get('message', 'Unknown Error')}"
+        if "error" in data: return [], f"ArcGIS Error: {data['error'].get('message', 'Unknown')}"
         
         features = data.get("features", [])
         return [f.get("attributes", {}) for f in features], "Success"
@@ -135,9 +134,9 @@ def mark_as_sent(ref):
 @app.get("/", response_class=HTMLResponse)
 def lander():
     return f"""
-    <html><body style='font-family:sans-serif;text-align:center;'>
-    <h1>Vector Data Labs V14.3</h1>
-    <p>Leeds: <b>ACTIVE</b> | London: <b>DEEP DISCOVERY</b></p>
+    <html><body style='font-family:sans-serif;text-align:center;padding-top:50px;'>
+    <h1>Vector Data Labs V15.0</h1>
+    <p>Leeds: <b>ACTIVE</b> | London: <b>MOBILE BREAKTHROUGH</b></p>
     <a href='/test-regional'>Run Health Check</a>
     </body></html>
     """
@@ -161,9 +160,9 @@ def scrape(secret: str = Query(...)):
         recs, _ = fetch_council(c_name, config)
         for r in recs:
             ref = str(r.get("REFERENCE") or r.get("PLANNO") or r.get("REFVAL") or r.get("OBJECTID"))
-            is_t, _ = classify(r)
+            is_tree, _ = classify(r)
             
-            if is_t and (get_d(r) >= cutoff or get_d(r) == 0) and not is_already_sent(ref):
+            if is_tree and (get_d(r) >= cutoff or get_d(r) == 0) and not is_already_sent(ref):
                 addr = r.get('full_address') or r.get('ADDRESS') or r.get('LOCATION') or r.get('SITE_ADDRESS')
                 prop = r.get('development_description') or r.get('PROPOSAL') or r.get('DESCRIPTION')
                 try:
@@ -190,8 +189,7 @@ def scrape(secret: str = Query(...)):
                     checkout = stripe.checkout.Session.create(
                         payment_method_types=["card"],
                         line_items=[{"price_data": {"currency": "gbp", "product_data": {"name": f"Lead: {ld.get('site_address')}"}, "unit_amount": amt}, "quantity": 1}],
-                        mode="payment", success_url=f"{P_URL}/payment-success",
-                        cancel_url=f"{P_URL}/payment-cancelled",
+                        mode="payment", success_url=f"{P_URL}/payment-success", cancel_url=f"{P_URL}/payment-cancelled",
                         metadata={"surgeon_id": str(sgn["id"]), "ref": ref, "site_address": ld.get("site_address")}
                     )
                     email_html = f"""
