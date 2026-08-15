@@ -1,4 +1,4 @@
-import os, json, logging, requests, psycopg2, stripe, urllib3
+import os, json, logging, requests, psycopg2, stripe, urllib3, time
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import HTMLResponse
@@ -7,7 +7,7 @@ from openai import OpenAI
 # Disable SSL warnings for internal council certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="Vector Data Labs - V18.0 Crawler Master", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs - V19.0 Deep-Crawl", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
@@ -22,28 +22,28 @@ client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# --- THE CRAWLER LIST (Organization Roots) ---
-# We provide the building address (the root). The engine finds the room (the service).
+# --- THE MASTER CRAWL LIST ---
+# We provide the 'Building Roots'. The engine will explore all subfolders.
 COUNCILS = {
     "Leeds_Control": {
-        "type": "static",
+        "type": "direct",
         "url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query",
         "referer": "https://www.leeds.gov.uk/"
     },
-    "London_Hub": {
-        "type": "crawl",
+    "London_Mega_Hub": {
+        "type": "discovery",
         "root": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services",
         "referer": "https://www.london.gov.uk/"
     },
     "Croydon_Direct": {
-        "type": "crawl",
-        "root": "https://maps.croydon.gov.uk/arcgis/rest/services/Planning",
-        "referer": "https://www.croydon.gov.uk/planning-and-regeneration"
+        "type": "discovery",
+        "root": "https://maps.croydon.gov.uk/arcgis/rest/services",
+        "referer": "https://maps.croydon.gov.uk/planning/index.html"
     },
     "Hillingdon_Direct": {
-        "type": "crawl",
+        "type": "discovery",
         "root": "https://maps.hillingdon.gov.uk/arcgis/rest/services",
-        "referer": "https://www.hillingdon.gov.uk/"
+        "referer": "https://www.hillingdon.gov.uk/planning"
     }
 }
 
@@ -66,48 +66,64 @@ def classify(r):
     if any(w in p for w in SKIP_WORDS) and score < 8: return False, 0
     return (score > 2), score
 
-# --- THE CRAWLER ENGINE ---
+# --- THE DISCOVERY ENGINE (Recursive V19) ---
 def fetch_council(name, config):
+    session = requests.Session()
     h = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Accept": "application/json",
-        "Referer": config["referer"]
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-GB,en;q=0.9",
+        "Referer": config["referer"],
+        "Sec-CH-UA": '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
+        "Sec-CH-UA-Platform": '"Windows"',
+        "Connection": "keep-alive"
     }
     q = {"where": "1=1", "outFields": "*", "resultRecordCount": 50, "orderByFields": "OBJECTID DESC", "f": "json"}
 
-    # Method 1: Static (Leeds style)
-    if config["type"] == "static":
+    # 1. Direct Path
+    if config["type"] == "direct":
         try:
-            res = requests.get(config["url"], params=q, headers=h, timeout=20, verify=False)
+            res = session.get(config["url"], params=q, headers=h, timeout=20, verify=False)
             if res.status_code == 200:
                 return [f.get("attributes", {}) for f in res.json().get("features", [])], "Success"
         except: pass
 
-    # Method 2: Catalog Crawl (Self-Healing)
-    if config["type"] == "crawl":
+    # 2. Recursive Discovery
+    if config["type"] == "discovery":
         try:
-            # A. Get the list of all services
-            catalog_res = requests.get(f"{config['root']}?f=json", headers=h, timeout=15, verify=False)
-            if "application/json" not in catalog_res.headers.get("Content-Type", ""):
-                return [], "Firewall Blocked (HTML)"
+            # Step A: Scan the main directory for Services AND Folders
+            root_res = session.get(f"{config['root']}?f=json", headers=h, timeout=15, verify=False)
+            data = root_res.json()
             
-            services = catalog_res.json().get("services", [])
-            # B. Find the best match for 'Planning'
-            found_url = None
-            for s in services:
-                s_name = s.get("name", "")
-                if "Planning" in s_name or "Development" in s_name:
-                    s_type = s.get("type", "FeatureServer")
-                    found_url = f"{config['root']}/{s_name}/{s_type}/0/query"
-                    break
-            
-            if found_url:
-                logger.info(f"Crawl found active service for {name}: {found_url}")
-                res = requests.get(found_url, params=q, headers=h, timeout=20, verify=False)
-                if res.status_code == 200 and "features" in res.text:
-                    return [f.get("attributes", {}) for f in res.json().get("features", [])], f"Success (Crawled)"
+            # Persist search across folders
+            search_queue = [""] # Empty string is the root
+            if "folders" in data:
+                search_queue.extend(data["folders"])
+
+            for folder in search_queue:
+                folder_url = f"{config['root']}/{folder}" if folder else config['root']
+                logger.info(f"Crawling {name} directory: {folder_url}")
+                
+                dir_res = session.get(f"{folder_url}?f=json", headers=h, timeout=10, verify=False)
+                services = dir_res.json().get("services", [])
+                
+                for s in services:
+                    sname = s.get("name", "").lower()
+                    # Look for Planning-related services
+                    if any(k in sname for k in ["planning", "development", "register"]):
+                        stype = s.get("type", "MapServer")
+                        # Step B: Test the layers (usually 0, 5, or 12)
+                        for layer_id in [0, 5, 12, 1]:
+                            query_url = f"{config['root']}/{s.get('name')}/{stype}/{layer_id}/query"
+                            try:
+                                res = session.get(query_url, params=q, headers=h, timeout=15, verify=False)
+                                if res.status_code == 200 and "features" in res.text:
+                                    features = res.json().get("features", [])
+                                    if len(features) > 0:
+                                        return [f.get("attributes", {}) for f in features], f"Cracked: {s.get('name')} (L{layer_id})"
+                            except: continue
         except Exception as e:
-            return [], f"Crawl Failed: {str(e)}"
+            return [], f"Discovery Fail: {str(e)}"
 
     return [], "Offline/Rotated"
 
@@ -135,16 +151,14 @@ def mark_as_sent(ref):
 @app.get("/", response_class=HTMLResponse)
 def lander():
     return f"""
-    <html>
-    <body style='font-family:sans-serif; text-align:center; padding-top:50px; background:#fafafa;'>
-    <div style='display:inline-block; padding:40px; background:white; border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,0.05); border-top: 5px solid #1a73e8;'>
-    <h1>Vector Data Labs V18.0</h1>
-    <p>Leeds: <b>ACTIVE</b> | London: <b>CRAWLER MODE</b></p>
+    <html><body style='font-family:sans-serif;text-align:center;padding-top:50px; background:#f4f4f9;'>
+    <div style='display:inline-block; padding:40px; background:white; border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,0.05); border-top: 5px solid #1b5e20;'>
+    <h1>Vector Data Labs V19.0</h1>
+    <p>Leeds: <b>ACTIVE</b> | Recursive Discovery: <b>INITIALIZED</b></p>
     <hr style='border:0; border-top:1px solid #eee; margin:20px 0;'/>
-    <a href='/test-regional' style='color:#1a73e8; text-decoration:none; font-weight:bold;'>Run Master Health Check</a>
+    <a href='/test-regional' style='color:#1b5e20; text-decoration:none; font-weight:bold;'>Run Master Intelligence Scan</a>
     </div>
-    </body>
-    </html>
+    </body></html>
     """
 
 @app.get("/test-regional")
@@ -195,16 +209,17 @@ def scrape(secret: str = Query(...)):
                     checkout = stripe.checkout.Session.create(
                         payment_method_types=["card"],
                         line_items=[{"price_data": {"currency": "gbp", "product_data": {"name": f"Lead: {ld.get('site_address')}"}, "unit_amount": amt}, "quantity": 1}],
-                        mode="payment", success_url=f"{P_URL}/payment-success", cancel_url=f"{P_URL}/payment-cancelled",
+                        mode="payment", success_url=f"{P_URL}/payment-success",
+                        cancel_url=f"{P_URL}/payment-cancelled",
                         metadata={"surgeon_id": str(sgn["id"]), "ref": ref, "site_address": ld.get("site_address")}
                     )
                     email_html = f"""
-                    <div style='font-family:sans-serif; border-left: 8px solid #1a73e8; padding:20px; background:#f9f9f9;'>
-                    <h2 style='color:#1a73e8;'>New Tree Lead: {c_name}</h2>
+                    <div style='font-family:sans-serif; border-left: 8px solid #1b5e20; padding:20px; background:#f9f9f9;'>
+                    <h2 style='color:#1b5e20;'>New Tree Lead: {c_name}</h2>
                     <p><strong>Work:</strong> {ld.get('scope_summary')}</p>
                     <p><strong>Location:</strong> {ld.get('site_address')}</p>
                     <br/>
-                    <a href='{checkout.url}' style='background:#1a73e8; color:white; padding:15px 30px; text-decoration:none; border-radius:5px; font-weight:bold; display:inline-block;'>Buy Lead Details (£{amt/100})</a>
+                    <a href='{checkout.url}' style='background:#1b5e20; color:white; padding:15px 30px; text-decoration:none; border-radius:5px; font-weight:bold; display:inline-block;'>Buy Lead Details (£{amt/100})</a>
                     </div>
                     """
                     requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [sgn["email"]], "subject": f"Lead: {ld.get('site_address')}", "html": email_html}, headers={"Authorization": f"Bearer {R_KEY}"})
@@ -215,8 +230,8 @@ def scrape(secret: str = Query(...)):
         if leads_sent >= 10: break
     return {"status": "success", "leads_sent": leads_sent}
 
-@app.get("/payment-success", include_in_schema=False)
+@app.get("/payment-success")
 def success(): return HTMLResponse("<h1>Success!</h1>")
 
-@app.get("/payment-cancelled", include_in_schema=False)
+@app.get("/payment-cancelled")
 def cancel(): return HTMLResponse("<h1>Cancelled</h1>")
