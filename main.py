@@ -7,7 +7,7 @@ from openai import OpenAI
 # Silence SSL warnings for councils with internal/self-signed certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="Vector Data Labs - V12.0 Master", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs - V13.0 Master", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
@@ -22,29 +22,29 @@ client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# --- THE MASTER LIST (V12.0 Stealth & Path Recovery) ---
+# --- THE MASTER LIST (V13.0 Verified Production Paths) ---
 COUNCILS = {
     "Leeds_Control": {
         "url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query",
         "referer": "https://www.leeds.gov.uk/"
     },
     "London_Mega_Hub": {
-        # Using the standard "Planning_London_Datahub" path
-        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_London_Datahub/FeatureServer/0/query",
+        # Targeted the absolute name of the GLA Planning Datahub
+        "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications/FeatureServer/0/query",
         "referer": "https://www.london.gov.uk/"
     },
     "Woking_Surrey": {
-        # Woking uses the same 'S96p' hub as London but a different service name
+        # Woking uses a specific service name on the GLA hub
         "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications_Woking/FeatureServer/0/query",
         "referer": "https://www.woking.gov.uk/"
     },
     "Hillingdon_London": {
-        # New direct endpoint discovered in Hillingdon PublicServices folder
-        "url": "https://maps.hillingdon.gov.uk/arcgis/rest/services/PublicServices/Planning_Applications/MapServer/0/query",
+        # Standardized to their main Planning service (PublicServices folder)
+        "url": "https://maps.hillingdon.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
         "referer": "https://www.hillingdon.gov.uk/"
     },
     "Croydon_Direct": {
-        # Croydon adds a firewall; we hit their MapServer but with improved headers
+        # Using MapServer/0 which is the most stable for Croydon
         "url": "https://maps.croydon.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
         "referer": "https://www.croydon.gov.uk/"
     }
@@ -57,8 +57,8 @@ def lander():
     <html>
         <body style='font-family:sans-serif; text-align:center; padding-top:50px; background:#fafafa;'>
             <div style='display:inline-block; padding:40px; background:white; border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,0.05);'>
-                <h1 style='color:#1a73e8;'>Vector Data Labs V12.0</h1>
-                <p>Status: <b> Leeds Master </b> Active</p>
+                <h1 style='color:#1a73e8;'>Vector Data Labs V13.0</h1>
+                <p>Status: <b> Leeds Master </b> Online</p>
                 <hr style='border:0; border-top:1px solid #eee; margin:20px 0;'/>
                 <a href='/test-regional' style='color:#1a73e8; text-decoration:none; font-weight:bold;'>Run Regional Health Check</a>
             </div>
@@ -95,38 +95,38 @@ def classify(r):
     
     return (score > 2), score
 
-# --- FETCHING LOGIC (Leeds BP + Stealth) ---
+# --- FETCHING LOGIC (Leeds Blueprint) ---
 def fetch_council(name, config):
     url = config["url"]
-    # Enhanced Headers to mimic a real Mac Browser
     h = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         "Referer": config["referer"],
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-GB,en;q=0.9",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive"
+        "Accept": "application/json"
     }
     q = {
         "where": "1=1", 
         "outFields": "*", 
-        "resultRecordCount": 100, 
+        "resultRecordCount": 50, 
         "orderByFields": "OBJECTID DESC", 
         "f": "json"
     }
     try:
         res = requests.get(url, params=q, headers=h, timeout=25, verify=False)
         
-        # Check if we were blocked by a firewall
+        # Check if the response is actually HTML (Firewall)
         if "<html>" in res.text.lower():
-            return [], "HTML Firewall Blocked (WAF)"
-        
+            return [], "HTML Firewall (Access Denied)"
+            
         if res.status_code != 200:
             return [], f"HTTP {res.status_code} Error"
         
-        data = res.json()
+        try:
+            data = res.json()
+        except Exception:
+            return [], "Invalid JSON Response"
+
         if "error" in data:
-            return [], f"ArcGIS: {data['error'].get('message')}"
+            return [], f"ArcGIS: {data['error'].get('message', 'Unknown Error')}"
             
         features = data.get("features", [])
         return [f.get("attributes", {}) for f in features], "Success"
@@ -207,7 +207,9 @@ def scrape(secret: str = Query(...)):
                     checkout = stripe.checkout.Session.create(
                         payment_method_types=["card"],
                         line_items=[{"price_data": {"currency": "gbp", "product_data": {"name": f"Lead: {ld.get('site_address')}"}, "unit_amount": amt}, "quantity": 1}],
-                        mode="payment", success_url=f"{P_URL}/payment-success", cancel_url=f"{P_URL}/payment-cancelled",
+                        mode="payment", 
+                        success_url=f"{P_URL}/payment-success", 
+                        cancel_url=f"{P_URL}/payment-cancelled",
                         metadata={"surgeon_id": str(sgn["id"]), "ref": ref, "site_address": ld.get("site_address")}
                     )
                     
