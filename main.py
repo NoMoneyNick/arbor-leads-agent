@@ -7,7 +7,7 @@ from openai import OpenAI
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="Vector Data Labs - V16.6 Master", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs - V16.7 Master", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
@@ -22,28 +22,28 @@ client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# --- THE MASTER LIST (Crawler Roots) ---
-# We provide the 'Service Root'. The engine will find the correct layer index automatically.
+# --- THE MASTER LIST (Organization Roots) ---
+# We point to the top-level Organization ID. The engine discovers the active service.
 COUNCILS = {
     "Leeds_Control": {
         "url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query",
         "referer": "https://www.leeds.gov.uk/"
     },
     "London_Mega_Hub": {
-        "base_service": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_London_Datahub",
+        "org_root": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services",
         "referer": "https://www.london.gov.uk/"
     },
     "Richmond_Wandsworth": {
-        "base_service": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications",
+        "org_root": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services",
         "referer": "https://www.wandsworth.gov.uk/"
     },
     "Woking_Surrey": {
-        "base_service": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications_Woking",
+        "org_root": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services",
         "referer": "https://www.woking.gov.uk/"
     },
     "Croydon_Direct": {
-        "base_service": "https://maps.croydon.gov.uk/arcgis/rest/services/Planning/Planning_Applications",
-        "referer": "https://www.croydon.gov.uk/planning-and-regeneration"
+        "org_root": "https://maps.croydon.gov.uk/arcgis/rest/services/Planning",
+        "referer": "https://maps.croydon.gov.uk/planning/index.html"
     }
 }
 
@@ -66,17 +66,21 @@ def classify(r):
     if any(w in p for w in SKIP_WORDS) and score < 8: return False, 0
     return (score > 2), score
 
-# --- FETCHING LOGIC (The Discovery Engine V16.6) ---
+# --- FETCHING LOGIC (The Master Discovery V16.7) ---
 def fetch_council(name, config):
     session = requests.Session()
     h = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "application/json",
-        "Referer": config["referer"]
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-GB,en;q=0.9",
+        "Referer": config["referer"],
+        "Upgrade-Insecure-Requests": "1",
+        "DNT": "1",
+        "Connection": "keep-alive"
     }
     q = {"where": "1=1", "outFields": "*", "resultRecordCount": 50, "orderByFields": "OBJECTID DESC", "f": "json"}
 
-    # 1. Standard Query (If direct URL exists)
+    # 1. Standard Query (If direct URL exists like Leeds)
     if "url" in config:
         try:
             res = session.get(config["url"], params=q, headers=h, timeout=20, verify=False)
@@ -84,34 +88,37 @@ def fetch_council(name, config):
                 return [f.get("attributes", {}) for f in res.json().get("features", [])], "Success"
         except: pass
 
-    # 2. Dynamic Discovery (The Notch Up)
-    if "base_service" in config:
+    # 2. Master Discovery Logic
+    if "org_root" in config:
         try:
-            # Step A: Get Metadata to find Service Type (MapServer/FeatureServer)
-            # Try both types if unknown
-            for s_type in ["FeatureServer", "MapServer"]:
-                service_url = f"{config['base_service']}/{s_type}"
-                meta_res = session.get(f"{service_url}?f=json", headers=h, timeout=10, verify=False)
+            # Step A: List all services in the building
+            meta_res = session.get(f"{config['org_root']}?f=json", headers=h, timeout=15, verify=False)
+            if "application/json" not in meta_res.headers.get("Content-Type", ""):
+                return [], "Firewall: Blocked (HTML Response)"
+            
+            services = meta_res.json().get("services", [])
+            # Step B: Filter for Planning services
+            planning_services = [s for s in services if any(k in s['name'].lower() for k in ["planning", "development", "register"])]
+            
+            for s in planning_services:
+                s_name = s['name']
+                s_type = s['type'] # MapServer or FeatureServer
                 
-                if meta_res.status_code == 200:
-                    layers = meta_res.json().get("layers", [])
-                    # Step B: Find the layer that mentions 'Applications'
-                    target_layer = 0 # Default
-                    for l in layers:
-                        lname = l.get("name", "").lower()
-                        if any(k in lname for k in ["application", "current", "live"]):
-                            target_layer = l.get("id")
-                            break
-                    
-                    # Step C: Hit the discovered layer
-                    query_url = f"{service_url}/{target_layer}/query"
-                    res = session.get(query_url, params=q, headers=h, timeout=20, verify=False)
-                    if res.status_code == 200 and "features" in res.text:
-                        return [f.get("attributes", {}) for f in res.json().get("features", [])], f"Found: {s_type} L{target_layer}"
+                # Step C: Layer Spray (Try indices that commonly hold data)
+                for l_id in [0, 5, 12, 1]:
+                    probe_url = f"{config['org_root']}/{s_name}/{s_type}/{l_id}/query"
+                    try:
+                        probe = session.get(probe_url, params=q, headers=h, timeout=10, verify=False)
+                        if probe.status_code == 200 and "features" in probe.text:
+                            data = probe.json()
+                            features = data.get("features", [])
+                            if len(features) > 0:
+                                return [f.get("attributes", {}) for f in features], f"Cracked: {s_name} (L{l_id})"
+                    except: continue
         except Exception as e:
-            return [], f"Discovery Fail: {str(e)}"
+            return [], f"Discovery Error: {str(e)}"
 
-    return [], "Status: Service Rotated"
+    return [], "Status: Service Hidden/Private"
 
 # --- DATABASE ---
 def is_already_sent(ref):
@@ -137,12 +144,12 @@ def mark_as_sent(ref):
 @app.get("/", response_class=HTMLResponse)
 def lander():
     return f"""
-    <html><body style='font-family:sans-serif;text-align:center;padding-top:50px; background:#fafafa;'>
-    <div style='display:inline-block; padding:40px; background:white; border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,0.05); border-top: 5px solid #1a73e8;'>
-    <h1>Vector Data Labs V16.6</h1>
-    <p>Leeds: <b>ACTIVE</b> | Discovery Engine: <b>ONLINE</b></p>
+    <html><body style='font-family:sans-serif;text-align:center;padding-top:50px; background:#f4f4f9;'>
+    <div style='display:inline-block; padding:40px; background:white; border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,0.05); border-top: 5px solid #2e7d32;'>
+    <h1>Vector Data Labs V16.7</h1>
+    <p>Leeds: <b>ACTIVE</b> | Discovery Engine: <b>ROOT SCANNING</b></p>
     <hr style='border:0; border-top:1px solid #eee; margin:20px 0;'/>
-    <a href='/test-regional' style='color:#1a73e8; text-decoration:none; font-weight:bold;'>Run Regional Scan</a>
+    <a href='/test-regional' style='color:#1a73e8; text-decoration:none; font-weight:bold;'>Run Master Health Check</a>
     </div>
     </body></html>
     """
