@@ -7,7 +7,7 @@ from openai import OpenAI
 # Silence SSL warnings for councils with internal/self-signed certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="Vector Data Labs - V9.9 London Siege", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs - V10.0 Master", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
@@ -22,8 +22,8 @@ client = OpenAI(api_key=OKEY)
 stripe.api_key = S_SEC
 _processed = set()
 
-# --- THE SIEGE LIST (V9.9 Verified Cloud Paths) ---
-# We use 'services2.arcgis.com' which is the stable ESRI cloud host for most UK councils.
+# --- THE MASTER LIST (V10.0 Verified Production Paths) ---
+# We are targeting the specific FeatureServer layers that drive their public maps.
 COUNCILS = {
     "Leeds_Control": {
         "url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query",
@@ -33,28 +33,43 @@ COUNCILS = {
         "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_London_Datahub/FeatureServer/0/query",
         "referer": "https://www.london.gov.uk/"
     },
-    "Croydon_Local": {
-        "url": "https://maps.croydon.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
-        "referer": "https://www.croydon.gov.uk/"
-    },
     "Woking_Surrey": {
         "url": "https://services2.arcgis.com/S96pW9S9VlU6z7fK/arcgis/rest/services/Planning_Applications_Live/FeatureServer/0/query",
         "referer": "https://www.woking.gov.uk/"
+    },
+    "Hillingdon_London": {
+        "url": "https://hillingdon.gov.uk/arcgis/rest/services/planning_local_plan_data_17/FeatureServer/0/query",
+        "referer": "https://www.hillingdon.gov.uk/"
+    },
+    "Croydon_Direct": {
+        "url": "https://maps.croydon.gov.uk/arcgis/rest/services/Planning/Planning_Applications/MapServer/0/query",
+        "referer": "https://www.croydon.gov.uk/"
     }
 }
 
 # --- WEB PAGES ---
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def lander():
-    return f"<html><body style='font-family:sans-serif;text-align:center;'><h1>Vector Data Labs V9.9</h1><p>Leeds: ACTIVE | London/Surrey: SIEGE</p><a href='/test-regional'>Run Health Check</a></body></html>"
+    return f"""
+    <html>
+        <body style='font-family:sans-serif; text-align:center; padding-top:50px; background:#fafafa;'>
+            <div style='display:inline-block; padding:40px; background:white; border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,0.05);'>
+                <h1 style='color:#1a73e8;'>Vector Data Labs V10.0</h1>
+                <p>System Online | Leeds <b>ACTIVE</b> | London <b>SIEGE</b></p>
+                <hr style='border:0; border-top:1px solid #eee; margin:20px 0;'/>
+                <a href='/test-regional' style='color:#1a73e8; text-decoration:none; font-weight:bold;'>Run Regional Health Check</a>
+            </div>
+        </body>
+    </html>
+    """
 
-# --- CLASSIFICATION LOGIC (DNA PRESERVED) ---
+# --- LOGIC: CLASSIFICATION ---
 TREE_WORDS = ["tree", "trees", "tpo", "felling", "fell", "crown", "pruning", "stump", "arboriculture", "oak", "ash ", "cedar", "conifer", "birch", "maple", "willow", "sycamore"]
-SKIP_WORDS = ["dwelling", "erection of", "new build", "extension", "loft conversion"]
+SKIP_WORDS = ["dwelling", "erection of", "new build", "extension", "loft conversion", "demolition"]
 
 def get_d(r):
     # Extracts timestamp from various possible ArcGIS date fields
-    v = r.get("DATE_RECEIVED") or r.get("DATE_VALID") or r.get("DATEAPVAL") or r.get("RECDAT") or 0
+    v = r.get("DATE_RECEIVED") or r.get("DATE_VALID") or r.get("DATEAPVAL") or r.get("RECDAT") or r.get("actual_decision_date") or 0
     try: return float(v)
     except: return 0
 
@@ -64,7 +79,8 @@ def classify(r):
         r.get("development_description") or 
         r.get("PROPOSAL") or 
         r.get("DESCRIPTION") or 
-        r.get("DESCRIPT") or ""
+        r.get("DESCRIPT") or 
+        r.get("DETDESC") or ""
     ).lower()
     
     if not p: return False, 0
@@ -80,7 +96,7 @@ def classify(r):
     
     return (score > 2), score
 
-# --- FETCHING LOGIC (DNA PRESERVED) ---
+# --- FETCHING LOGIC ---
 def fetch_council(name, config):
     url = config["url"]
     h = {
@@ -96,19 +112,25 @@ def fetch_council(name, config):
         "f": "json"
     }
     try:
-        # verify=False is critical for London borough servers
         res = requests.get(url, params=q, headers=h, timeout=20, verify=False)
         if res.status_code != 200:
             return [], f"HTTP {res.status_code} Error"
-        data = res.json()
+        
+        # Check if response is actually JSON
+        try:
+            data = res.json()
+        except:
+            return [], "HTML Error Page (Firewall)"
+
         if "error" in data:
             return [], f"ArcGIS Error: {data['error'].get('message')}"
+            
         features = data.get("features", [])
         return [f.get("attributes", {}) for f in features], "Success"
     except Exception as e:
         return [], f"Connection Fail: {str(e)}"
 
-# --- DATABASE (DNA PRESERVED) ---
+# --- DATABASE ---
 def is_already_sent(ref):
     if not SURL: return False
     try:
@@ -155,6 +177,7 @@ def scrape(secret: str = Query(...)):
             if is_tree and (get_d(r) >= cutoff or get_d(r) == 0) and not is_already_sent(ref):
                 addr = r.get('full_address') or r.get('ADDRESS') or r.get('LOCATION') or r.get('SITE_ADDRESS')
                 prop = r.get('development_description') or r.get('PROPOSAL') or r.get('DESCRIPTION')
+                
                 try:
                     ai = client.chat.completions.create(
                         model="gpt-4o-mini", response_format={"type": "json_object"},
@@ -164,6 +187,7 @@ def scrape(secret: str = Query(...)):
                     ld = json.loads(ai.choices[0].message.content)
                 except: continue
 
+                # Get Active Surgeons
                 surgeons = []
                 if SURL:
                     try:
@@ -172,9 +196,11 @@ def scrape(secret: str = Query(...)):
                         for row in c.fetchall(): surgeons.append({"id": row[0], "email": row[1]})
                         db.close()
                     except: pass
+                
                 if not surgeons: surgeons.append({"id": 1, "email": T_EM})
 
                 for sgn in surgeons:
+                    # London Pricing: £35 / £60
                     amt = 6000 if ld.get("high_value") else 3500
                     checkout = stripe.checkout.Session.create(
                         payment_method_types=["card"],
@@ -182,7 +208,17 @@ def scrape(secret: str = Query(...)):
                         mode="payment", success_url=f"{P_URL}/payment-success", cancel_url=f"{P_URL}/payment-cancelled",
                         metadata={"surgeon_id": str(sgn["id"]), "ref": ref, "site_address": ld.get("site_address")}
                     )
-                    requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [sgn["email"]], "subject": f"Lead: {ld.get('site_address')}", "html": f"<h3>New Lead</h3><p>{ld['scope_summary']}</p><a href='{checkout.url}'>Buy Lead</a>"}, headers={"Authorization": f"Bearer {R_KEY}"})
+                    
+                    email_html = f"""
+                    <div style='font-family:sans-serif; border-left: 10px solid #1a73e8; padding:20px; background:#f9f9f9;'>
+                        <h2 style='color:#1a73e8;'>New Tree Lead: {c_name}</h2>
+                        <p><strong>Work:</strong> {ld.get('scope_summary')}</p>
+                        <p><strong>Location:</strong> {ld.get('site_address')}</p>
+                        <br/>
+                        <a href='{checkout.url}' style='background:#1a73e8; color:white; padding:15px 30px; text-decoration:none; border-radius:5px; font-weight:bold; display:inline-block;'>Buy Lead Details (£{amt/100})</a>
+                    </div>
+                    """
+                    requests.post(R_URL, json={"from": "Vector Data Labs <onboarding@resend.dev>", "to": [sgn["email"]], "subject": f"Lead: {ld.get('site_address')}", "html": email_html}, headers={"Authorization": f"Bearer {R_KEY}"})
                 
                 mark_as_sent(ref)
                 leads_sent += 1
