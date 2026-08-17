@@ -7,19 +7,29 @@ import re
 import time
 import math
 
-from datetime import datetime, timezone
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
+
 # ============================================================
 # VECTOR DATA LABS
-# V82.0 - LEEDS + 15 MILE SERVICE AREA DISCOVERY
+# V83.0 - LEEDS + 15 MILE SERVICE AREA DISCOVERY
+#
+# V83 FIXES:
+# - Correct Haversine distance calculation
+# - Safe handling of failed postcode lookups
+# - Never crashes because lat/lon is None
+# - Correct 15-mile geographic filtering
+# - Improved tree-company name filtering
+# - Database postcode migration retained
 # ============================================================
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+urllib3.disable_warnings(
+    urllib3.exceptions.InsecureRequestWarning
+)
 
 app = FastAPI(
-    title="Vector Data Labs - V82.0 Leeds Discovery Master",
+    title="Vector Data Labs - V83.0 Leeds Discovery",
     docs_url="/docs"
 )
 
@@ -34,7 +44,14 @@ logger = logging.getLogger("vector-data-labs")
 SURL = os.getenv("SUPABASE_DB_URL")
 CH_KEY = os.getenv("COMPANIES_HOUSE_KEY")
 
-COMPANIES_HOUSE_URL = "https://api.company-information.service.gov.uk"
+COMPANIES_HOUSE_URL = (
+    "https://api.company-information.service.gov.uk"
+)
+
+
+# ============================================================
+# COMPANIES HOUSE SEARCH TERMS
+# ============================================================
 
 SEARCH_TERMS = [
     "tree",
@@ -50,15 +67,19 @@ SEARCH_TERMS = [
     "landscaping"
 ]
 
+
 ITEMS_PER_PAGE = 50
 MAX_RESULTS_PER_TERM = 200
 
 REQUEST_DELAY = 0.25
 
-# Leeds service radius
+
+# ============================================================
+# LEEDS SERVICE AREA
+# ============================================================
+
 SERVICE_RADIUS_MILES = 15.0
 
-# Leeds approximate centre
 LEEDS_LAT = 53.8008
 LEEDS_LON = -1.5491
 
@@ -68,22 +89,44 @@ LEEDS_LON = -1.5491
 # ============================================================
 
 TREE_TERMS = [
-    "tree",
-    "trees",
-    "arbor",
     "arborist",
     "arboriculture",
-    "forestry",
-    "woodland",
-    "stump",
-    "treecare",
-    "tree care",
     "tree surgeon",
     "tree surgery",
     "tree services",
     "tree service",
+    "tree care",
     "tree felling",
-    "tree removal"
+    "tree removal",
+    "stump grinding",
+    "stump removal",
+    "forestry",
+    "woodland"
+]
+
+
+# Terms that are useful when appearing as standalone words.
+#
+# "tree" is deliberately handled separately because searching
+# Companies House for "tree" produces false positives such as:
+#
+# TREE ACCOUNTANCY LIMITED
+# TREE ADVISORY GROUP LIMITED
+# TREE AID
+#
+# A company called "Tree & Garden Services" is relevant, but
+# "Tree Accountancy" is not.
+# ============================================================
+
+TREE_STANDALONE_RELEVANT_PATTERNS = [
+    r"\btree\s+(services?|surgery|surgeon|care|felling|removal)\b",
+    r"\btree\s*&\s*(garden|ground|landscape|woodland|hedge)\b",
+    r"\btree\s+and\s+(garden|ground|landscape|woodland|hedge)\b",
+    r"\bstump\s+(grinding|removal)\b",
+    r"\barborist\b",
+    r"\barboriculture\b",
+    r"\bforestry\b",
+    r"\bwoodland\b"
 ]
 
 
@@ -102,7 +145,6 @@ def init_db():
         conn = psycopg2.connect(SURL)
         cur = conn.cursor()
 
-        # Base table
         cur.execute("""
             CREATE TABLE IF NOT EXISTS potential_partners (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -122,9 +164,7 @@ def init_db():
         """)
 
         # ----------------------------------------------------
-        # IMPORTANT:
-        # Existing databases may already have the table.
-        # Therefore we add new columns safely with IF NOT EXISTS.
+        # Safe migrations for existing Supabase database
         # ----------------------------------------------------
 
         cur.execute("""
@@ -144,7 +184,8 @@ def init_db():
 
         cur.execute("""
             ALTER TABLE potential_partners
-            ADD COLUMN IF NOT EXISTS tree_related_name BOOLEAN DEFAULT FALSE;
+            ADD COLUMN IF NOT EXISTS tree_related_name BOOLEAN
+            DEFAULT FALSE;
         """)
 
         cur.execute("""
@@ -157,28 +198,35 @@ def init_db():
         cur.close()
         conn.close()
 
-        logger.info("Database schema verified and migrated.")
+        logger.info(
+            "Database schema verified and migrated."
+        )
 
     except Exception as e:
 
-        logger.error(f"Database migration error: {e}")
+        logger.error(
+            f"Database migration error: {e}"
+        )
 
 
 init_db()
 
 
 # ============================================================
-# HTTP SESSION
+# COMPANIES HOUSE SESSION
 # ============================================================
 
 def get_ch_session():
 
     session = requests.Session()
 
-    session.auth = (CH_KEY, "")
+    session.auth = (
+        CH_KEY,
+        ""
+    )
 
     session.headers.update({
-        "User-Agent": "VectorDataLabs/82.0"
+        "User-Agent": "VectorDataLabs/83.0"
     })
 
     return session
@@ -195,11 +243,18 @@ def clean_postcode(value):
 
     value = str(value).upper().strip()
 
-    # Remove commas and repeated whitespace
-    value = re.sub(r"[^A-Z0-9 ]", "", value)
-    value = re.sub(r"\s+", " ", value)
+    value = re.sub(
+        r"[^A-Z0-9 ]",
+        "",
+        value
+    )
 
-    # UK postcode pattern
+    value = re.sub(
+        r"\s+",
+        " ",
+        value
+    )
+
     match = re.search(
         r"\b([A-Z]{1,2}\d[A-Z\d]?)\s?(\d[A-Z]{2})\b",
         value
@@ -208,7 +263,10 @@ def clean_postcode(value):
     if not match:
         return None
 
-    return f"{match.group(1)}{match.group(2)}"
+    return (
+        f"{match.group(1)}"
+        f"{match.group(2)}"
+    )
 
 
 # ============================================================
@@ -220,26 +278,23 @@ def extract_postcode(address):
     if not address:
         return None
 
-    address = str(address).upper()
-
-    match = re.search(
-        r"\b([A-Z]{1,2}\d[A-Z\d]?)\s?(\d[A-Z]{2})\b",
-        address
-    )
-
-    if not match:
-        return None
-
-    return f"{match.group(1)}{match.group(2)}"
+    return clean_postcode(address)
 
 
 # ============================================================
-# POSTCODE -> APPROXIMATE COORDINATES
+# POSTCODE -> COORDINATES
 #
-# Uses postcodes.io public API.
+# Uses postcodes.io.
+#
+# IMPORTANT:
+# Failed lookups return (None, None).
+# The caller MUST check both values before calculating distance.
 # ============================================================
 
-def postcode_coordinates(session, postcode):
+def postcode_coordinates(
+    session,
+    postcode
+):
 
     if not postcode:
         return None, None
@@ -272,12 +327,16 @@ def postcode_coordinates(session, postcode):
         if lat is None or lon is None:
             return None, None
 
-        return float(lat), float(lon)
+        return (
+            float(lat),
+            float(lon)
+        )
 
     except Exception as e:
 
         logger.warning(
-            f"Postcode lookup failed for {postcode}: {e}"
+            f"Postcode lookup failed for "
+            f"{postcode}: {e}"
         )
 
         return None, None
@@ -285,44 +344,100 @@ def postcode_coordinates(session, postcode):
 
 # ============================================================
 # HAVERSINE DISTANCE
+#
+# FIXED IN V83.
+#
+# The previous version incorrectly converted latitude/longitude
+# values multiple times, producing wildly incorrect distances.
 # ============================================================
 
-def distance_miles(lat1, lon1, lat2, lon2):
+def distance_miles(
+    lat1,
+    lon1,
+    lat2,
+    lon2
+):
+
+    # Never allow invalid coordinates through.
+    if (
+        lat1 is None
+        or lon1 is None
+        or lat2 is None
+        or lon2 is None
+    ):
+        return None
+
+    try:
+
+        lat1_rad = math.radians(
+            float(lat1)
+        )
+
+        lon1_rad = math.radians(
+            float(lon1)
+        )
+
+        lat2_rad = math.radians(
+            float(lat2)
+        )
+
+        lon2_rad = math.radians(
+            float(lon2)
+        )
+
+    except (
+        TypeError,
+        ValueError
+    ):
+
+        return None
 
     earth_radius_km = 6371.0
 
-    lat1 = math.radians(lat1)
-    lat2 = math.radians(lat2)
+    delta_lat = (
+        lat2_rad - lat1_rad
+    )
 
-    delta_lat = math.radians(lat2 - lat1)
-    delta_lon = math.radians(lon2 - lon1)
+    delta_lon = (
+        lon2_rad - lon1_rad
+    )
 
     a = (
         math.sin(delta_lat / 2) ** 2
         +
-        math.cos(lat1)
+        math.cos(lat1_rad)
         *
-        math.cos(lat2)
+        math.cos(lat2_rad)
         *
         math.sin(delta_lon / 2) ** 2
     )
 
-    c = 2 * math.atan2(
-        math.sqrt(a),
-        math.sqrt(1 - a)
+    # Protect against tiny floating point errors.
+    a = max(
+        0.0,
+        min(1.0, a)
     )
 
-    kilometres = earth_radius_km * c
+    c = (
+        2
+        *
+        math.atan2(
+            math.sqrt(a),
+            math.sqrt(1 - a)
+        )
+    )
+
+    kilometres = (
+        earth_radius_km * c
+    )
 
     return kilometres * 0.621371
 
 
 # ============================================================
-# LEEDS CORE TEST
+# LEEDS CORE POSTCODE TEST
 #
-# LS postcode district = Leeds area.
-# We use LS + valid postcode structure rather than merely
-# searching for the letters "LS".
+# LS postcode district.
 # ============================================================
 
 def is_leeds_core_postcode(postcode):
@@ -330,7 +445,11 @@ def is_leeds_core_postcode(postcode):
     if not postcode:
         return False
 
-    postcode = postcode.upper().replace(" ", "")
+    postcode = (
+        postcode
+        .upper()
+        .replace(" ", "")
+    )
 
     return bool(
         re.match(
@@ -342,6 +461,8 @@ def is_leeds_core_postcode(postcode):
 
 # ============================================================
 # TREE COMPANY NAME TEST
+#
+# Improved to reduce false positives.
 # ============================================================
 
 def name_looks_tree_related(name):
@@ -349,12 +470,120 @@ def name_looks_tree_related(name):
     if not name:
         return False
 
-    name = name.lower()
+    text = str(name).lower()
 
-    return any(
-        term in name
-        for term in TREE_TERMS
+    # Strong specific tree-sector terms.
+    for pattern in TREE_STANDALONE_RELEVANT_PATTERNS:
+
+        if re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE
+        ):
+            return True
+
+    # Direct arboriculture/arborist/forestry terms.
+    strong_terms = [
+        "arborist",
+        "arboriculture",
+        "forestry",
+        "tree surgeon",
+        "tree surgery",
+        "tree care",
+        "tree felling",
+        "tree removal",
+        "stump grinding",
+        "stump removal",
+        "woodland"
+    ]
+
+    for term in strong_terms:
+
+        if term in text:
+            return True
+
+    return False
+
+
+# ============================================================
+# SEARCH-TERM + COMPANY NAME CLASSIFICATION
+#
+# Some legitimate businesses may have names such as:
+#
+# "Smith Tree & Garden"
+# "Smith Landscaping"
+#
+# Landscaping can therefore be relevant even without the word
+# tree in the company name.
+# ============================================================
+
+def company_is_relevant(
+    name,
+    search_term
+):
+
+    if name_looks_tree_related(name):
+        return True
+
+    name_lower = (
+        str(name or "")
+        .lower()
+        .strip()
     )
+
+    search_lower = (
+        str(search_term or "")
+        .lower()
+        .strip()
+    )
+
+    # A landscaping search can produce legitimate tree/grounds
+    # businesses, but we don't want unrelated accountants etc.
+    if search_lower == "landscaping":
+
+        landscaping_terms = [
+            "landscap",
+            "garden",
+            "grounds",
+            "horticulture",
+            "arbor",
+            "tree",
+            "hedge"
+        ]
+
+        return any(
+            term in name_lower
+            for term in landscaping_terms
+        )
+
+    # Forestry search.
+    if search_lower == "forestry":
+
+        return any(
+            term in name_lower
+            for term in [
+                "forestry",
+                "forest",
+                "woodland",
+                "tree",
+                "arbor"
+            ]
+        )
+
+    # Stump grinding.
+    if search_lower == "stump grinding":
+
+        return any(
+            term in name_lower
+            for term in [
+                "stump",
+                "tree",
+                "arbor"
+            ]
+        )
+
+    # All other searches require an actual relevant name.
+    return name_looks_tree_related(name)
 
 
 # ============================================================
@@ -366,8 +595,13 @@ def classify_service_area(distance):
     if distance is None:
         return "Unknown"
 
-    if distance <= 15:
-        return "Leeds 15 Mile Service Area"
+    if distance <= SERVICE_RADIUS_MILES:
+
+        return (
+            "Leeds Core"
+            if distance <= SERVICE_RADIUS_MILES
+            else "Leeds 15 Mile Service Area"
+        )
 
     return "Outside Service Area"
 
@@ -387,7 +621,9 @@ def save_partner(
     search_term
 ):
 
-    company_number = company.get("company_number")
+    company_number = company.get(
+        "company_number"
+    )
 
     if not company_number:
         return "invalid"
@@ -403,7 +639,6 @@ def save_partner(
 
     if cur.fetchone():
 
-        # Update verification/geographical information
         cur.execute(
             """
             UPDATE potential_partners
@@ -414,17 +649,21 @@ def save_partner(
                 distance_from_leeds_miles = %s,
                 service_area = %s,
                 tree_related_name = %s,
+                search_term = %s,
                 last_verified = NOW(),
                 updated_at = NOW()
             WHERE company_number = %s
             """,
             (
-                company.get("company_status"),
+                company.get(
+                    "company_status"
+                ),
                 address,
                 postcode,
                 distance,
                 service_area,
                 tree_related_name,
+                search_term,
                 company_number
             )
         )
@@ -471,8 +710,12 @@ def save_partner(
         (
             company.get("title"),
             company_number,
-            company.get("company_status"),
-            company.get("date_of_creation"),
+            company.get(
+                "company_status"
+            ),
+            company.get(
+                "date_of_creation"
+            ),
             address,
             postcode,
             distance,
@@ -480,7 +723,11 @@ def save_partner(
             tree_related_name,
             50,
             "Companies House Leeds 15 Mile Discovery",
-            f"https://find-and-update.company-information.service.gov.uk/company/{company_number}",
+            (
+                "https://find-and-update.company-information."
+                "service.gov.uk/company/"
+                + company_number
+            ),
             search_term
         )
     )
@@ -495,69 +742,114 @@ def save_partner(
 def discover_leeds_partners():
 
     if not CH_KEY:
+
         return {
             "status": "error",
-            "message": "COMPANIES_HOUSE_KEY missing"
+            "message": (
+                "COMPANIES_HOUSE_KEY missing"
+            )
         }
 
     if not SURL:
+
         return {
             "status": "error",
-            "message": "SUPABASE_DB_URL missing"
+            "message": (
+                "SUPABASE_DB_URL missing"
+            )
         }
 
     stats = {
+
         "status": "success",
+
         "search_terms": 0,
+
         "pages_scanned": 0,
+
         "companies_examined": 0,
+
         "active_companies": 0,
+
         "inactive_companies": 0,
+
         "valid_postcodes": 0,
+
         "leeds_core_matches": 0,
+
         "within_15_mile_matches": 0,
+
         "outside_service_area": 0,
+
         "tree_named_companies": 0,
+
+        "irrelevant_name_matches": 0,
+
         "new_partners_added": 0,
+
         "duplicates_skipped": 0,
+
         "api_errors": 0,
+
         "postcode_lookup_errors": 0,
+
         "sample_results": [],
+
         "sample_leeds_matches": []
     }
 
     session = get_ch_session()
 
-    # Avoid looking up the same postcode hundreds of times.
+    # Cache postcode coordinates.
     postcode_cache = {}
 
+    # Avoid examining same company repeatedly during this run.
     seen_in_run = set()
 
     try:
 
-        conn = psycopg2.connect(SURL)
+        conn = psycopg2.connect(
+            SURL
+        )
+
         cur = conn.cursor()
+
+        # ====================================================
+        # SEARCH EACH TERM
+        # ====================================================
 
         for search_term in SEARCH_TERMS:
 
             logger.info(
-                f"Searching Companies House for: {search_term}"
+                f"Searching Companies House for: "
+                f"{search_term}"
             )
 
-            stats["search_terms"] += 1
+            stats[
+                "search_terms"
+            ] += 1
 
             start_index = 0
 
-            while start_index < MAX_RESULTS_PER_TERM:
+            while (
+                start_index
+                <
+                MAX_RESULTS_PER_TERM
+            ):
 
                 try:
 
                     response = session.get(
-                        f"{COMPANIES_HOUSE_URL}/search/companies",
+                        (
+                            f"{COMPANIES_HOUSE_URL}"
+                            "/search/companies"
+                        ),
                         params={
                             "q": search_term,
-                            "items_per_page": ITEMS_PER_PAGE,
-                            "start_index": start_index
+                            "items_per_page":
+                                ITEMS_PER_PAGE,
+                            "start_index":
+                                start_index
                         },
                         timeout=20
                     )
@@ -565,19 +857,28 @@ def discover_leeds_partners():
                 except Exception as e:
 
                     logger.error(
-                        f"Companies House request error: {e}"
+                        "Companies House "
+                        f"request error: {e}"
                     )
 
-                    stats["api_errors"] += 1
+                    stats[
+                        "api_errors"
+                    ] += 1
+
                     break
 
                 if response.status_code != 200:
 
                     logger.error(
-                        f"Companies House returned HTTP {response.status_code}"
+                        "Companies House "
+                        f"returned HTTP "
+                        f"{response.status_code}"
                     )
 
-                    stats["api_errors"] += 1
+                    stats[
+                        "api_errors"
+                    ] += 1
+
                     break
 
                 try:
@@ -586,52 +887,101 @@ def discover_leeds_partners():
 
                 except Exception:
 
-                    stats["api_errors"] += 1
+                    stats[
+                        "api_errors"
+                    ] += 1
+
                     break
 
-                items = data.get("items", [])
+                items = data.get(
+                    "items",
+                    []
+                )
 
                 if not items:
                     break
 
-                stats["pages_scanned"] += 1
+                stats[
+                    "pages_scanned"
+                ] += 1
+
+                # ============================================
+                # PROCESS COMPANIES
+                # ============================================
 
                 for company in items:
 
-                    stats["companies_examined"] += 1
+                    stats[
+                        "companies_examined"
+                    ] += 1
 
-                    company_number = company.get(
-                        "company_number"
+                    company_number = (
+                        company.get(
+                            "company_number"
+                        )
                     )
 
                     if not company_number:
                         continue
 
-                    if company_number in seen_in_run:
+                    if (
+                        company_number
+                        in seen_in_run
+                    ):
                         continue
 
-                    seen_in_run.add(company_number)
+                    seen_in_run.add(
+                        company_number
+                    )
 
                     status = company.get(
                         "company_status"
                     )
 
                     if status == "active":
-                        stats["active_companies"] += 1
+
+                        stats[
+                            "active_companies"
+                        ] += 1
+
                     else:
-                        stats["inactive_companies"] += 1
+
+                        stats[
+                            "inactive_companies"
+                        ] += 1
 
                     name = company.get(
                         "title",
                         ""
                     )
 
-                    tree_related = name_looks_tree_related(
-                        name
+                    # ----------------------------------------
+                    # Tree-sector classification
+                    # ----------------------------------------
+
+                    tree_related = (
+                        company_is_relevant(
+                            name,
+                            search_term
+                        )
                     )
 
                     if tree_related:
-                        stats["tree_named_companies"] += 1
+
+                        stats[
+                            "tree_named_companies"
+                        ] += 1
+
+                    else:
+
+                        stats[
+                            "irrelevant_name_matches"
+                        ] += 1
+
+                        # Don't waste postcode API calls on
+                        # obvious unrelated Companies House
+                        # results.
+                        continue
 
                     address = company.get(
                         "address_snippet",
@@ -645,28 +995,42 @@ def discover_leeds_partners():
                     if not postcode:
                         continue
 
-                    stats["valid_postcodes"] += 1
+                    stats[
+                        "valid_postcodes"
+                    ] += 1
 
-                    # ----------------------------------------
-                    # Postcode lookup
-                    # ----------------------------------------
+                    # ========================================
+                    # POSTCODE LOOKUP
+                    # ========================================
 
                     if postcode in postcode_cache:
 
-                        lat, lon = postcode_cache[postcode]
+                        lat, lon = (
+                            postcode_cache[
+                                postcode
+                            ]
+                        )
 
                     else:
 
-                        lat, lon = postcode_coordinates(
-                            session,
-                            postcode
+                        lat, lon = (
+                            postcode_coordinates(
+                                session,
+                                postcode
+                            )
                         )
 
                         postcode_cache[
                             postcode
-                        ] = (lat, lon)
+                        ] = (
+                            lat,
+                            lon
+                        )
 
-                        if lat is None or lon is None:
+                        if (
+                            lat is None
+                            or lon is None
+                        ):
 
                             stats[
                                 "postcode_lookup_errors"
@@ -674,12 +1038,31 @@ def discover_leeds_partners():
 
                             continue
 
-                        # Avoid hammering postcodes.io
-                        time.sleep(0.05)
+                        time.sleep(
+                            0.05
+                        )
 
-                    # ----------------------------------------
-                    # Calculate distance from Leeds
-                    # ----------------------------------------
+                    # ========================================
+                    # CRITICAL SAFETY CHECK
+                    #
+                    # This prevents the exact NoneType crash
+                    # that appeared in your Render log.
+                    # ========================================
+
+                    if (
+                        lat is None
+                        or lon is None
+                    ):
+
+                        stats[
+                            "postcode_lookup_errors"
+                        ] += 1
+
+                        continue
+
+                    # ========================================
+                    # DISTANCE FROM LEEDS
+                    # ========================================
 
                     distance = distance_miles(
                         LEEDS_LAT,
@@ -688,13 +1071,27 @@ def discover_leeds_partners():
                         lon
                     )
 
+                    if distance is None:
+
+                        stats[
+                            "postcode_lookup_errors"
+                        ] += 1
+
+                        continue
+
                     distance = round(
                         distance,
                         2
                     )
 
-                    is_core = is_leeds_core_postcode(
-                        postcode
+                    # ========================================
+                    # LEEDS CORE
+                    # ========================================
+
+                    is_core = (
+                        is_leeds_core_postcode(
+                            postcode
+                        )
                     )
 
                     if is_core:
@@ -703,19 +1100,45 @@ def discover_leeds_partners():
                             "leeds_core_matches"
                         ] += 1
 
-                    if distance <= SERVICE_RADIUS_MILES:
+                    # ========================================
+                    # SERVICE AREA
+                    #
+                    # IMPORTANT:
+                    # We use actual geographic distance.
+                    #
+                    # Therefore a postcode in BD/WF/HG/YO
+                    # is included ONLY if its actual location
+                    # is within 15 miles of Leeds.
+                    #
+                    # No manual postcode-district list needed.
+                    # ========================================
+
+                    if (
+                        distance
+                        <= SERVICE_RADIUS_MILES
+                    ):
 
                         stats[
                             "within_15_mile_matches"
                         ] += 1
 
-                        service_area = (
-                            "Leeds Core"
-                            if is_core
-                            else "Leeds 15 Mile Service Area"
-                        )
+                        if is_core:
 
-                        # Only active businesses become partners.
+                            service_area = (
+                                "Leeds Core"
+                            )
+
+                        else:
+
+                            service_area = (
+                                "Leeds 15 Mile "
+                                "Service Area"
+                            )
+
+                        # ------------------------------------
+                        # Only active companies become partners
+                        # ------------------------------------
+
                         if status == "active":
 
                             result = save_partner(
@@ -741,22 +1164,43 @@ def discover_leeds_partners():
                                     "duplicates_skipped"
                                 ] += 1
 
-                        # Sample results
+                        # ------------------------------------
+                        # Leeds sample
+                        # ------------------------------------
+
                         if len(
-                            stats["sample_leeds_matches"]
+                            stats[
+                                "sample_leeds_matches"
+                            ]
                         ) < 20:
 
                             stats[
                                 "sample_leeds_matches"
                             ].append({
-                                "company_name": name,
-                                "company_number": company_number,
-                                "status": status,
-                                "address": address,
-                                "postcode": postcode,
-                                "distance_from_leeds_miles": distance,
-                                "service_area": service_area,
-                                "tree_related_name": tree_related
+
+                                "company_name":
+                                    name,
+
+                                "company_number":
+                                    company_number,
+
+                                "status":
+                                    status,
+
+                                "address":
+                                    address,
+
+                                "postcode":
+                                    postcode,
+
+                                "distance_from_leeds_miles":
+                                    distance,
+
+                                "service_area":
+                                    service_area,
+
+                                "tree_related_name":
+                                    tree_related
                             })
 
                     else:
@@ -765,41 +1209,76 @@ def discover_leeds_partners():
                             "outside_service_area"
                         ] += 1
 
-                    # General sample results
+                    # ========================================
+                    # GENERAL SAMPLE
+                    # ========================================
+
                     if len(
-                        stats["sample_results"]
+                        stats[
+                            "sample_results"
+                        ]
                     ) < 20:
 
                         stats[
                             "sample_results"
                         ].append({
-                            "search_term": search_term,
-                            "company_name": name,
-                            "company_number": company_number,
-                            "status": status,
-                            "address": address,
-                            "postcode": postcode,
-                            "distance_from_leeds_miles": distance,
-                            "leeds_core": is_core,
-                            "within_15_miles": (
-                                distance <= SERVICE_RADIUS_MILES
-                            ),
-                            "tree_related_name": tree_related
+
+                            "search_term":
+                                search_term,
+
+                            "company_name":
+                                name,
+
+                            "company_number":
+                                company_number,
+
+                            "status":
+                                status,
+
+                            "address":
+                                address,
+
+                            "postcode":
+                                postcode,
+
+                            "distance_from_leeds_miles":
+                                distance,
+
+                            "leeds_core":
+                                is_core,
+
+                            "within_15_miles":
+                                (
+                                    distance
+                                    <= SERVICE_RADIUS_MILES
+                                ),
+
+                            "tree_related_name":
+                                tree_related
                         })
 
+                # Commit after each page.
                 conn.commit()
 
-                # ----------------------------------------
-                # Pagination
-                # ----------------------------------------
+                # ============================================
+                # PAGINATION
+                # ============================================
 
-                start_index += ITEMS_PER_PAGE
+                start_index += (
+                    ITEMS_PER_PAGE
+                )
 
-                if len(items) < ITEMS_PER_PAGE:
+                if (
+                    len(items)
+                    <
+                    ITEMS_PER_PAGE
+                ):
+
                     break
 
-                # Respectful delay
-                time.sleep(REQUEST_DELAY)
+                time.sleep(
+                    REQUEST_DELAY
+                )
 
         cur.close()
         conn.close()
@@ -828,8 +1307,11 @@ def fetch_council():
     session = requests.Session()
 
     session.headers.update({
-        "User-Agent": "VectorDataLabs/82.0",
-        "Referer": "https://www.leeds.gov.uk/"
+        "User-Agent":
+            "VectorDataLabs/83.0",
+
+        "Referer":
+            "https://www.leeds.gov.uk/"
     })
 
     url = (
@@ -841,11 +1323,21 @@ def fetch_council():
     try:
 
         params = {
-            "where": "1=1",
-            "outFields": "*",
-            "resultRecordCount": 100,
-            "orderByFields": "OBJECTID DESC",
-            "f": "json"
+
+            "where":
+                "1=1",
+
+            "outFields":
+                "*",
+
+            "resultRecordCount":
+                100,
+
+            "orderByFields":
+                "OBJECTID DESC",
+
+            "f":
+                "json"
         }
 
         response = session.get(
@@ -862,10 +1354,12 @@ def fetch_council():
         data = response.json()
 
         records = [
+
             feature.get(
                 "attributes",
                 {}
             )
+
             for feature in data.get(
                 "features",
                 []
@@ -888,6 +1382,7 @@ def fetch_council():
 # ============================================================
 
 TREE_GOLD = [
+
     "tree",
     "trees",
     "tpo",
@@ -911,6 +1406,7 @@ TREE_GOLD = [
 
 
 DESCRIPTION_FIELDS = [
+
     "proposal",
     "description",
     "development_description",
@@ -926,23 +1422,39 @@ DESCRIPTION_FIELDS = [
 def extract_council_description(record):
 
     # First look for likely planning-description fields.
+
     for key in record.keys():
 
-        key_lower = str(key).lower()
+        key_lower = str(
+            key
+        ).lower()
 
         for field in DESCRIPTION_FIELDS:
 
-            if field.lower() == key_lower:
+            if (
+                field.lower()
+                ==
+                key_lower
+            ):
 
-                value = record.get(key)
+                value = record.get(
+                    key
+                )
 
                 if value:
-                    return str(value).strip()
+
+                    return str(
+                        value
+                    ).strip()
 
     # Fallback: inspect all text fields.
+
     for key, value in record.items():
 
-        if isinstance(value, str):
+        if isinstance(
+            value,
+            str
+        ):
 
             text = value.strip()
 
@@ -958,8 +1470,10 @@ def extract_council_description(record):
 
 def smart_classify(record):
 
-    description = extract_council_description(
-        record
+    description = (
+        extract_council_description(
+            record
+        )
     )
 
     if not description:
@@ -973,15 +1487,25 @@ def smart_classify(record):
     for word in TREE_GOLD:
 
         if word in text:
-            matches.append(word)
+
+            matches.append(
+                word
+            )
 
     if not matches:
 
-        return False, 0, description
+        return (
+            False,
+            0,
+            description
+        )
 
-    score = len(
-        set(matches)
-    ) * 5
+    score = (
+        len(
+            set(matches)
+        )
+        * 5
+    )
 
     if any(
         x in text
@@ -1010,29 +1534,44 @@ def smart_classify(record):
 
 def get_council_leads():
 
-    records, status = fetch_council()
+    records, status = (
+        fetch_council()
+    )
 
     leads = []
 
     for record in records:
 
-        matched, score, description = smart_classify(
-            record
+        matched, score, description = (
+            smart_classify(
+                record
+            )
         )
 
         if not matched:
             continue
 
-        # Create a clean human-readable lead.
         lead = {
-            "score": score,
-            "summary": description,
-            "record": record
+
+            "score":
+                score,
+
+            "summary":
+                description,
+
+            "record":
+                record
         }
 
-        leads.append(lead)
+        leads.append(
+            lead
+        )
 
-    return records, status, leads
+    return (
+        records,
+        status,
+        leads
+    )
 
 
 # ============================================================
@@ -1074,7 +1613,7 @@ def lander():
             </h1>
 
             <h2>
-                V82.0 Leeds Discovery Master
+                V83.0 Leeds Discovery Master
             </h2>
 
             <div style="
@@ -1086,10 +1625,17 @@ def lander():
                 font-size:14px;
             ">
 
-                <b>Core area:</b> Leeds LS postcodes<br>
-                <b>Extended area:</b> 15-mile radius from Leeds<br>
-                <b>Business source:</b> Companies House<br>
-                <b>Planning source:</b> Leeds City Council
+                <b>Core area:</b>
+                Leeds LS postcodes<br>
+
+                <b>Extended area:</b>
+                15-mile geographic radius from Leeds<br>
+
+                <b>Business source:</b>
+                Companies House<br>
+
+                <b>Planning source:</b>
+                Leeds City Council
 
             </div>
 
@@ -1132,7 +1678,9 @@ def lander():
 # BUSINESS DISCOVERY ROUTE
 # ============================================================
 
-@app.get("/research-leeds")
+@app.get(
+    "/research-leeds"
+)
 def run_discovery():
 
     return discover_leeds_partners()
@@ -1142,17 +1690,31 @@ def run_discovery():
 # LEEDS COUNCIL TEST ROUTE
 # ============================================================
 
-@app.get("/test-regional")
+@app.get(
+    "/test-regional"
+)
 def test_leeds():
 
-    records, status, leads = get_council_leads()
+    records, status, leads = (
+        get_council_leads()
+    )
 
     return {
-        "council": "Leeds",
-        "status": status,
-        "records_checked": len(records),
-        "leads_detected": len(leads),
-        "leads": leads
+
+        "council":
+            "Leeds",
+
+        "status":
+            status,
+
+        "records_checked":
+            len(records),
+
+        "leads_detected":
+            len(leads),
+
+        "leads":
+            leads
     }
 
 
@@ -1160,15 +1722,27 @@ def test_leeds():
 # HEALTH CHECK
 # ============================================================
 
-@app.get("/health")
+@app.get(
+    "/health"
+)
 def health():
 
     return {
-        "status": "online",
-        "version": "82.0",
-        "database_configured": bool(SURL),
-        "companies_house_configured": bool(CH_KEY),
-        "service_area_miles": SERVICE_RADIUS_MILES
+
+        "status":
+            "online",
+
+        "version":
+            "83.0",
+
+        "database_configured":
+            bool(SURL),
+
+        "companies_house_configured":
+            bool(CH_KEY),
+
+        "service_area_miles":
+            SERVICE_RADIUS_MILES
     }
 
 
