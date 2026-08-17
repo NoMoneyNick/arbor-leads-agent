@@ -8,14 +8,22 @@ import time
 import math
 import threading
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
-
 # ============================================================
 # VECTOR DATA LABS
-# V83.0 - LEEDS DISCOVERY + PERSISTENT RESEARCH STATUS
+# V84.0 - LEEDS LEAD FINDER
+#
+# PURPOSE
+# ------------------------------------------------------------
+# 1. Discover potential tree businesses around Leeds.
+# 2. Search Leeds Council planning data.
+# 3. Identify genuine tree-related applications.
+# 4. Extract useful lead information.
+# 5. Score and store council leads.
+# 6. Run long research jobs in the background.
 # ============================================================
 
 urllib3.disable_warnings(
@@ -23,7 +31,7 @@ urllib3.disable_warnings(
 )
 
 app = FastAPI(
-    title="Vector Data Labs - V83.0 Leeds Discovery",
+    title="Vector Data Labs - V84.0 Leeds Lead Finder",
     docs_url="/docs"
 )
 
@@ -52,7 +60,7 @@ COMPANIES_HOUSE_URL = (
 
 
 # ============================================================
-# SEARCH TERMS
+# COMPANIES HOUSE SEARCH TERMS
 # ============================================================
 
 SEARCH_TERMS = [
@@ -76,6 +84,11 @@ MAX_RESULTS_PER_TERM = 200
 
 REQUEST_DELAY = 0.25
 
+
+# ============================================================
+# LEEDS SERVICE AREA
+# ============================================================
+
 SERVICE_RADIUS_MILES = 15.0
 
 LEEDS_LAT = 53.8008
@@ -84,7 +97,31 @@ LEEDS_LON = -1.5491
 
 
 # ============================================================
-# TREE TERMS
+# COUNCIL SETTINGS
+# ============================================================
+
+COUNCIL_NAME = "Leeds"
+
+COUNCIL_SOURCE = (
+    "Leeds City Council"
+)
+
+COUNCIL_URL = (
+    "https://mapservices.leeds.gov.uk/"
+    "arcgis/rest/services/Public/"
+    "Planning/MapServer/12/query"
+)
+
+# How far back a dated application may be considered recent.
+RECENT_DAYS = 365
+
+# Maximum number of council records requested
+# in each ArcGIS page.
+COUNCIL_PAGE_SIZE = 200
+
+
+# ============================================================
+# TREE BUSINESS CLASSIFICATION
 # ============================================================
 
 TREE_TERMS = [
@@ -107,55 +144,165 @@ TREE_TERMS = [
 ]
 
 
+# ============================================================
+# COUNCIL TREE CLASSIFICATION
+# ============================================================
+
 TREE_GOLD = [
     "tree",
     "trees",
     "tpo",
     "fell",
     "felling",
+    "felled",
+    "remove",
+    "removal",
     "arboriculture",
     "arborist",
+    "arboricultural",
     "crown",
+    "crowning",
+    "crown reduction",
+    "crown lift",
+    "crown lifting",
     "pruning",
     "prune",
+    "pollard",
+    "pollarding",
     "stump",
+    "stump removal",
     "oak",
     "ash",
     "willow",
     "cedar",
     "sycamore",
     "beech",
+    "birch",
+    "pine",
+    "fir",
     "hedge",
-    "woodland"
+    "woodland",
+    "vegetation"
 ]
 
+
+# Strong job/action terms receive extra points.
+TREE_JOB_TERMS = [
+    "fell",
+    "felling",
+    "remove",
+    "removal",
+    "pruning",
+    "prune",
+    "pollard",
+    "pollarding",
+    "crown reduction",
+    "crown lift",
+    "crown lifting",
+    "tree works",
+    "tree work",
+    "arboricultural works",
+    "arboricultural work",
+    "stump removal"
+]
+
+
+# ============================================================
+# POSSIBLE COUNCIL DESCRIPTION FIELDS
+# ============================================================
 
 DESCRIPTION_FIELDS = [
     "proposal",
     "description",
     "development_description",
+    "developmentdescription",
     "nature",
     "details",
     "PROPOSAL",
     "siteAddress",
     "site_address",
-    "address"
+    "address",
+    "description_of_proposal",
+    "application_description",
+    "proposal_description",
+    "planning_description",
+    "development"
 ]
 
 
 # ============================================================
-# RESEARCH STATE
+# POSSIBLE DATE FIELDS
+# ============================================================
+
+DATE_FIELD_NAMES = [
+    "date",
+    "application_date",
+    "date_received",
+    "received_date",
+    "valid_date",
+    "registration_date",
+    "decision_date",
+    "date_registered",
+    "submission_date",
+    "start_date",
+    "created_date",
+    "created",
+    "received",
+    "validfrom",
+    "valid_from"
+]
+
+
+# ============================================================
+# POSSIBLE REFERENCE FIELDS
+# ============================================================
+
+REFERENCE_FIELD_NAMES = [
+    "application_number",
+    "application_no",
+    "applicationreference",
+    "application_reference",
+    "reference",
+    "ref",
+    "planning_reference",
+    "planning_application",
+    "applicationid",
+    "application_id",
+    "case_number",
+    "case_reference"
+]
+
+
+# ============================================================
+# POSSIBLE ADDRESS FIELDS
+# ============================================================
+
+ADDRESS_FIELD_NAMES = [
+    "siteAddress",
+    "site_address",
+    "siteaddress",
+    "address",
+    "property_address",
+    "location",
+    "site",
+    "address_line",
+    "full_address"
+]
+
+
+# ============================================================
+# GLOBAL RESEARCH STATE
 # ============================================================
 
 research_lock = threading.Lock()
 
-research_running = False
-
-research_started_at = None
-
-research_finished_at = None
-
-latest_research_result = None
+research_state = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "last_result": None,
+    "error": None
+}
 
 
 # ============================================================
@@ -180,8 +327,11 @@ def init_db():
 
         cur = conn.cursor()
 
-        cur.execute(
-            """
+        # ----------------------------------------------------
+        # Potential customers
+        # ----------------------------------------------------
+
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS potential_partners (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 company_name TEXT,
@@ -197,43 +347,57 @@ def init_db():
                 last_verified TIMESTAMPTZ,
                 updated_at TIMESTAMPTZ
             );
-            """
-        )
+        """)
 
-        cur.execute(
-            """
+        cur.execute("""
             ALTER TABLE potential_partners
             ADD COLUMN IF NOT EXISTS postcode TEXT;
-            """
-        )
+        """)
 
-        cur.execute(
-            """
+        cur.execute("""
             ALTER TABLE potential_partners
             ADD COLUMN IF NOT EXISTS distance_from_leeds_miles NUMERIC;
-            """
-        )
+        """)
 
-        cur.execute(
-            """
+        cur.execute("""
             ALTER TABLE potential_partners
             ADD COLUMN IF NOT EXISTS service_area TEXT;
-            """
-        )
+        """)
 
-        cur.execute(
-            """
+        cur.execute("""
             ALTER TABLE potential_partners
             ADD COLUMN IF NOT EXISTS tree_related_name BOOLEAN DEFAULT FALSE;
-            """
-        )
+        """)
 
-        cur.execute(
-            """
+        cur.execute("""
             ALTER TABLE potential_partners
             ADD COLUMN IF NOT EXISTS search_term TEXT;
-            """
-        )
+        """)
+
+        # ----------------------------------------------------
+        # Council leads
+        # ----------------------------------------------------
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS council_leads (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                council TEXT,
+                source TEXT,
+                application_reference TEXT,
+                application_date TIMESTAMPTZ,
+                address TEXT,
+                postcode TEXT,
+                summary TEXT,
+                matched_terms TEXT[],
+                score INT DEFAULT 0,
+                recent BOOLEAN DEFAULT FALSE,
+                source_url TEXT,
+                raw_record JSONB,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(council, application_reference, address)
+            );
+        """)
 
         conn.commit()
 
@@ -247,8 +411,8 @@ def init_db():
 
     except Exception as e:
 
-        logger.exception(
-            "Database migration error."
+        logger.error(
+            f"Database migration error: {e}"
         )
 
 
@@ -270,7 +434,7 @@ def get_ch_session():
 
     session.headers.update({
         "User-Agent":
-            "VectorDataLabs/83.0"
+            "VectorDataLabs/84.0"
     })
 
     return session
@@ -327,27 +491,13 @@ def extract_postcode(address):
 
         return None
 
-    address = str(
+    return clean_postcode(
         address
-    ).upper()
-
-    match = re.search(
-        r"\b([A-Z]{1,2}\d[A-Z\d]?)\s?(\d[A-Z]{2})\b",
-        address
-    )
-
-    if not match:
-
-        return None
-
-    return (
-        f"{match.group(1)}"
-        f"{match.group(2)}"
     )
 
 
 # ============================================================
-# POSTCODE COORDINATES
+# POSTCODE -> COORDINATES
 # ============================================================
 
 def postcode_coordinates(
@@ -405,8 +555,8 @@ def postcode_coordinates(
     except Exception as e:
 
         logger.warning(
-            f"Postcode lookup failed for "
-            f"{postcode}: {e}"
+            f"Postcode lookup failed "
+            f"for {postcode}: {e}"
         )
 
         return None, None
@@ -442,13 +592,17 @@ def distance_miles(
     )
 
     a = (
-        math.sin(delta_lat / 2) ** 2
+        math.sin(
+            delta_lat / 2
+        ) ** 2
         +
         math.cos(lat1)
         *
         math.cos(lat2)
         *
-        math.sin(delta_lon / 2) ** 2
+        math.sin(
+            delta_lon / 2
+        ) ** 2
     )
 
     c = 2 * math.atan2(
@@ -460,13 +614,11 @@ def distance_miles(
         earth_radius_km * c
     )
 
-    return (
-        kilometres * 0.621371
-    )
+    return kilometres * 0.621371
 
 
 # ============================================================
-# LEEDS CORE POSTCODE
+# LEEDS POSTCODE TEST
 # ============================================================
 
 def is_leeds_core_postcode(
@@ -516,27 +668,24 @@ def name_looks_tree_related(
 # ============================================================
 
 def classify_service_area(
-    distance,
-    is_core
+    distance
 ):
 
     if distance is None:
 
         return "Unknown"
 
-    if distance <= SERVICE_RADIUS_MILES:
+    if distance <= 15:
 
-        if is_core:
-
-            return "Leeds Core"
-
-        return "Leeds 15 Mile Service Area"
+        return (
+            "Leeds 15 Mile Service Area"
+        )
 
     return "Outside Service Area"
 
 
 # ============================================================
-# SAVE PARTNER
+# SAVE BUSINESS PARTNER
 # ============================================================
 
 def save_partner(
@@ -558,7 +707,6 @@ def save_partner(
 
         return "invalid"
 
-
     cur.execute(
         """
         SELECT 1
@@ -569,7 +717,6 @@ def save_partner(
             company_number,
         )
     )
-
 
     if cur.fetchone():
 
@@ -583,9 +730,9 @@ def save_partner(
                 distance_from_leeds_miles = %s,
                 service_area = %s,
                 tree_related_name = %s,
-                search_term = %s,
                 last_verified = NOW(),
-                updated_at = NOW()
+                updated_at = NOW(),
+                search_term = %s
             WHERE company_number = %s
             """,
             (
@@ -603,7 +750,6 @@ def save_partner(
         )
 
         return "duplicate"
-
 
     cur.execute(
         """
@@ -643,9 +789,7 @@ def save_partner(
         )
         """,
         (
-            company.get(
-                "title"
-            ),
+            company.get("title"),
             company_number,
             company.get(
                 "company_status"
@@ -661,8 +805,8 @@ def save_partner(
             50,
             "Companies House Leeds 15 Mile Discovery",
             (
-                "https://find-and-update.company-information."
-                "service.gov.uk/company/"
+                "https://find-and-update.company-"
+                "information.service.gov.uk/company/"
                 + company_number
             ),
             search_term
@@ -673,71 +817,52 @@ def save_partner(
 
 
 # ============================================================
-# EMPTY STATS
-# ============================================================
-
-def create_stats():
-
-    return {
-        "status": "success",
-        "version": "83.0",
-        "search_terms": 0,
-        "pages_scanned": 0,
-        "companies_examined": 0,
-        "unique_companies_examined": 0,
-        "active_companies": 0,
-        "inactive_companies": 0,
-        "valid_postcodes": 0,
-        "postcode_lookup_errors": 0,
-        "leeds_core_matches": 0,
-        "within_15_mile_matches": 0,
-        "outside_service_area": 0,
-        "tree_named_companies": 0,
-        "tree_named_leeds_matches": 0,
-        "new_partners_added": 0,
-        "duplicates_skipped": 0,
-        "api_errors": 0,
-        "sample_results": [],
-        "sample_tree_leads": []
-    }
-
-
-# ============================================================
 # COMPANIES HOUSE DISCOVERY
 # ============================================================
 
 def discover_leeds_partners():
 
-    stats = create_stats()
-
     if not CH_KEY:
 
-        stats["status"] = "error"
-
-        stats["message"] = (
-            "COMPANIES_HOUSE_KEY missing"
-        )
-
-        return stats
-
+        return {
+            "status": "error",
+            "message":
+                "COMPANIES_HOUSE_KEY missing"
+        }
 
     if not SURL:
 
-        stats["status"] = "error"
+        return {
+            "status": "error",
+            "message":
+                "SUPABASE_DB_URL missing"
+        }
 
-        stats["message"] = (
-            "SUPABASE_DB_URL missing"
-        )
-
-        return stats
-
+    stats = {
+        "status": "success",
+        "search_terms": 0,
+        "pages_scanned": 0,
+        "companies_examined": 0,
+        "active_companies": 0,
+        "inactive_companies": 0,
+        "valid_postcodes": 0,
+        "leeds_core_matches": 0,
+        "within_15_mile_matches": 0,
+        "outside_service_area": 0,
+        "tree_named_companies": 0,
+        "new_partners_added": 0,
+        "duplicates_skipped": 0,
+        "api_errors": 0,
+        "postcode_lookup_errors": 0,
+        "sample_results": [],
+        "sample_leeds_matches": []
+    }
 
     session = get_ch_session()
 
     postcode_cache = {}
 
     seen_in_run = set()
-
 
     try:
 
@@ -746,7 +871,6 @@ def discover_leeds_partners():
         )
 
         cur = conn.cursor()
-
 
         for search_term in SEARCH_TERMS:
 
@@ -759,22 +883,19 @@ def discover_leeds_partners():
                 "search_terms"
             ] += 1
 
-
             start_index = 0
-
 
             while (
                 start_index
-                < MAX_RESULTS_PER_TERM
+                <
+                MAX_RESULTS_PER_TERM
             ):
 
                 try:
 
                     response = session.get(
-                        (
-                            f"{COMPANIES_HOUSE_URL}"
-                            f"/search/companies"
-                        ),
+                        f"{COMPANIES_HOUSE_URL}"
+                        "/search/companies",
                         params={
                             "q": search_term,
                             "items_per_page":
@@ -788,7 +909,7 @@ def discover_leeds_partners():
                 except Exception as e:
 
                     logger.error(
-                        "Companies House "
+                        f"Companies House "
                         f"request error: {e}"
                     )
 
@@ -797,7 +918,6 @@ def discover_leeds_partners():
                     ] += 1
 
                     break
-
 
                 if response.status_code != 200:
 
@@ -813,7 +933,6 @@ def discover_leeds_partners():
 
                     break
 
-
                 try:
 
                     data = response.json()
@@ -826,22 +945,18 @@ def discover_leeds_partners():
 
                     break
 
-
                 items = data.get(
                     "items",
                     []
                 )
 
-
                 if not items:
 
                     break
 
-
                 stats[
                     "pages_scanned"
                 ] += 1
-
 
                 for company in items:
 
@@ -849,38 +964,27 @@ def discover_leeds_partners():
                         "companies_examined"
                     ] += 1
 
-
                     company_number = (
                         company.get(
                             "company_number"
                         )
                     )
 
-
                     if not company_number:
 
                         continue
-
 
                     if company_number in seen_in_run:
 
                         continue
 
-
                     seen_in_run.add(
                         company_number
                     )
 
-
-                    stats[
-                        "unique_companies_examined"
-                    ] += 1
-
-
                     status = company.get(
                         "company_status"
                     )
-
 
                     if status == "active":
 
@@ -894,12 +998,10 @@ def discover_leeds_partners():
                             "inactive_companies"
                         ] += 1
 
-
                     name = company.get(
                         "title",
                         ""
                     )
-
 
                     tree_related = (
                         name_looks_tree_related(
@@ -907,36 +1009,28 @@ def discover_leeds_partners():
                         )
                     )
 
-
                     if tree_related:
 
                         stats[
                             "tree_named_companies"
                         ] += 1
 
-
                     address = company.get(
                         "address_snippet",
                         ""
                     )
 
-
-                    postcode = (
-                        extract_postcode(
-                            address
-                        )
+                    postcode = extract_postcode(
+                        address
                     )
-
 
                     if not postcode:
 
                         continue
 
-
                     stats[
                         "valid_postcodes"
                     ] += 1
-
 
                     if postcode in postcode_cache:
 
@@ -962,7 +1056,6 @@ def discover_leeds_partners():
                             lon
                         )
 
-
                         if (
                             lat is None
                             or
@@ -975,27 +1068,21 @@ def discover_leeds_partners():
 
                             continue
 
-
                         time.sleep(
                             0.05
                         )
 
-
-                    distance = (
-                        distance_miles(
-                            LEEDS_LAT,
-                            LEEDS_LON,
-                            lat,
-                            lon
-                        )
+                    distance = distance_miles(
+                        LEEDS_LAT,
+                        LEEDS_LON,
+                        lat,
+                        lon
                     )
-
 
                     distance = round(
                         distance,
                         2
                     )
-
 
                     is_core = (
                         is_leeds_core_postcode(
@@ -1003,60 +1090,63 @@ def discover_leeds_partners():
                         )
                     )
 
-
                     if is_core:
 
                         stats[
                             "leeds_core_matches"
                         ] += 1
 
-
-                    within_radius = (
+                    if (
                         distance
-                        <= SERVICE_RADIUS_MILES
-                    )
-
-
-                    if within_radius:
+                        <=
+                        SERVICE_RADIUS_MILES
+                    ):
 
                         stats[
                             "within_15_mile_matches"
                         ] += 1
 
-                    else:
-
-                        stats[
-                            "outside_service_area"
-                        ] += 1
-
-
-                    service_area = (
-                        classify_service_area(
-                            distance,
-                            is_core
+                        service_area = (
+                            "Leeds Core"
+                            if is_core
+                            else
+                            "Leeds 15 Mile "
+                            "Service Area"
                         )
-                    )
 
+                        if status == "active":
 
-                    if (
-                        within_radius
-                        and
-                        tree_related
-                    ):
+                            result = save_partner(
+                                cur,
+                                company,
+                                address,
+                                postcode,
+                                distance,
+                                service_area,
+                                tree_related,
+                                search_term
+                            )
 
-                        stats[
-                            "tree_named_leeds_matches"
-                        ] += 1
+                            if result == "new":
 
+                                stats[
+                                    "new_partners_added"
+                                ] += 1
+
+                            elif result == "duplicate":
+
+                                stats[
+                                    "duplicates_skipped"
+                                ] += 1
 
                         if len(
                             stats[
-                                "sample_tree_leads"
+                                "sample_leeds_matches"
                             ]
-                        ) < 30:
+                        ) < 20:
 
                             stats[
-                                "sample_tree_leads"
+                                "sample_leeds_matches"
                             ].append({
                                 "company_name":
                                     name,
@@ -1072,48 +1162,21 @@ def discover_leeds_partners():
                                     distance,
                                 "service_area":
                                     service_area,
-                                "search_term":
-                                    search_term
+                                "tree_related_name":
+                                    tree_related
                             })
 
+                    else:
 
-                    if (
-                        within_radius
-                        and
-                        status == "active"
-                    ):
-
-                        result = save_partner(
-                            cur=cur,
-                            company=company,
-                            address=address,
-                            postcode=postcode,
-                            distance=distance,
-                            service_area=service_area,
-                            tree_related_name=tree_related,
-                            search_term=search_term
-                        )
-
-
-                        if result == "new":
-
-                            stats[
-                                "new_partners_added"
-                            ] += 1
-
-
-                        elif result == "duplicate":
-
-                            stats[
-                                "duplicates_skipped"
-                            ] += 1
-
+                        stats[
+                            "outside_service_area"
+                        ] += 1
 
                     if len(
                         stats[
                             "sample_results"
                         ]
-                    ) < 30:
+                    ) < 20:
 
                         stats[
                             "sample_results"
@@ -1135,42 +1198,34 @@ def discover_leeds_partners():
                             "leeds_core":
                                 is_core,
                             "within_15_miles":
-                                within_radius,
+                                (
+                                    distance
+                                    <=
+                                    SERVICE_RADIUS_MILES
+                                ),
                             "tree_related_name":
                                 tree_related
                         })
 
-
                 conn.commit()
-
 
                 start_index += (
                     ITEMS_PER_PAGE
                 )
 
-
                 if len(items) < ITEMS_PER_PAGE:
 
                     break
-
 
                 time.sleep(
                     REQUEST_DELAY
                 )
 
-
         cur.close()
 
         conn.close()
 
-
-        logger.info(
-            "BACKGROUND RESEARCH FINISHED"
-        )
-
-
         return stats
-
 
     except Exception as e:
 
@@ -1178,242 +1233,651 @@ def discover_leeds_partners():
             "Database save/discovery error"
         )
 
-        stats["status"] = "error"
-
-        stats["message"] = str(
-            e
-        )
-
-        return stats
-
-
-# ============================================================
-# BACKGROUND WORKER
-# ============================================================
-
-def background_research():
-
-    global research_running
-
-    global research_finished_at
-
-    global latest_research_result
-
-
-    try:
-
-        logger.info(
-            "BACKGROUND RESEARCH STARTED"
-        )
-
-
-        result = (
-            discover_leeds_partners()
-        )
-
-
-        latest_research_result = result
-
-        research_finished_at = (
-            datetime.now(
-                timezone.utc
-            ).isoformat()
-        )
-
-
-    except Exception as e:
-
-        logger.exception(
-            "Background research failed"
-        )
-
-        latest_research_result = {
+        return {
             "status": "error",
-            "version": "83.0",
-            "message": str(e)
+            "message": str(e),
+            "stats": stats
         }
 
 
-    finally:
-
-        research_running = False
-
-
 # ============================================================
-# START RESEARCH
+# COUNCIL HTTP SESSION
 # ============================================================
 
-def start_research():
-
-    global research_running
-
-    global research_started_at
-
-
-    with research_lock:
-
-        if research_running:
-
-            return False
-
-
-        research_running = True
-
-        research_started_at = (
-            datetime.now(
-                timezone.utc
-            ).isoformat()
-        )
-
-
-        thread = threading.Thread(
-            target=background_research,
-            daemon=True
-        )
-
-
-        thread.start()
-
-
-        return True
-
-
-# ============================================================
-# LEEDS COUNCIL
-# ============================================================
-
-def fetch_council():
+def get_council_session():
 
     session = requests.Session()
 
     session.headers.update({
         "User-Agent":
-            "VectorDataLabs/83.0",
+            "VectorDataLabs/84.0",
         "Referer":
             "https://www.leeds.gov.uk/"
     })
 
+    return session
 
-    url = (
-        "https://mapservices.leeds.gov.uk/"
-        "arcgis/rest/services/Public/"
-        "Planning/MapServer/12/query"
-    )
 
+# ============================================================
+# FETCH COUNCIL RECORDS
+# ============================================================
+
+def fetch_council():
+
+    session = get_council_session()
+
+    records = []
+
+    offset = 0
 
     try:
 
-        params = {
-            "where": "1=1",
-            "outFields": "*",
-            "resultRecordCount": 100,
-            "orderByFields":
-                "OBJECTID DESC",
-            "f": "json"
-        }
+        while True:
 
+            params = {
+                "where": "1=1",
+                "outFields": "*",
+                "resultRecordCount":
+                    COUNCIL_PAGE_SIZE,
+                "resultOffset":
+                    offset,
+                "orderByFields":
+                    "OBJECTID DESC",
+                "f": "json"
+            }
 
-        response = session.get(
-            url,
-            params=params,
-            timeout=20,
-            verify=False
-        )
-
-
-        if response.status_code != 200:
-
-            return [], "Offline"
-
-
-        data = response.json()
-
-
-        records = [
-            feature.get(
-                "attributes",
-                {}
+            response = session.get(
+                COUNCIL_URL,
+                params=params,
+                timeout=30,
+                verify=False
             )
-            for feature in data.get(
+
+            if response.status_code != 200:
+
+                logger.error(
+                    "Leeds Council returned "
+                    f"HTTP {response.status_code}"
+                )
+
+                return records, "Offline"
+
+            data = response.json()
+
+            features = data.get(
                 "features",
                 []
             )
-        ]
 
+            if not features:
+
+                break
+
+            page_records = [
+                feature.get(
+                    "attributes",
+                    {}
+                )
+                for feature in features
+            ]
+
+            records.extend(
+                page_records
+            )
+
+            exceeded = data.get(
+                "exceededTransferLimit",
+                False
+            )
+
+            if (
+                len(features)
+                <
+                COUNCIL_PAGE_SIZE
+            ):
+
+                break
+
+            if not exceeded and len(
+                features
+            ) < COUNCIL_PAGE_SIZE:
+
+                break
+
+            offset += (
+                COUNCIL_PAGE_SIZE
+            )
+
+            # Safety limit.
+            if offset >= 5000:
+
+                break
+
+            time.sleep(
+                0.2
+            )
 
         return records, "Online"
-
 
     except Exception as e:
 
         logger.error(
-            "Leeds Council request error: "
-            f"{e}"
+            f"Leeds Council request error: {e}"
         )
 
-        return [], "Fault"
+        return records, "Fault"
 
 
 # ============================================================
-# COUNCIL DESCRIPTION
+# FIND FIELD VALUE
+# ============================================================
+
+def find_field_value(
+    record,
+    possible_names
+):
+
+    # Exact case-insensitive match first.
+    for wanted in possible_names:
+
+        for key, value in record.items():
+
+            if str(key).lower() == (
+                wanted.lower()
+            ):
+
+                if (
+                    value is not None
+                    and
+                    str(value).strip()
+                ):
+
+                    return str(value).strip()
+
+    # Fuzzy second pass.
+    for key, value in record.items():
+
+        key_lower = (
+            str(key).lower()
+        )
+
+        if not (
+            value is not None
+            and
+            str(value).strip()
+        ):
+
+            continue
+
+        for wanted in possible_names:
+
+            wanted_lower = (
+                wanted.lower()
+            )
+
+            if (
+                wanted_lower in key_lower
+                or
+                key_lower in wanted_lower
+            ):
+
+                return str(value).strip()
+
+    return ""
+
+
+# ============================================================
+# DESCRIPTION EXTRACTION
 # ============================================================
 
 def extract_council_description(
     record
 ):
 
-    for key in record.keys():
+    # First check likely planning fields.
+    value = find_field_value(
+        record,
+        DESCRIPTION_FIELDS
+    )
 
-        key_lower = str(
-            key
-        ).lower()
+    if value:
 
+        return value
 
-        for field in DESCRIPTION_FIELDS:
-
-            if (
-                field.lower()
-                ==
-                key_lower
-            ):
-
-                value = record.get(
-                    key
-                )
-
-                if value:
-
-                    return str(
-                        value
-                    ).strip()
-
+    # Fallback: collect useful text fields.
+    candidates = []
 
     for key, value in record.items():
 
-        if isinstance(
+        if not isinstance(
             value,
             str
         ):
 
-            text = value.strip()
+            continue
 
+        text = value.strip()
 
-            if any(
-                term in text.lower()
-                for term in TREE_GOLD
-            ):
+        if not text:
 
-                return text
+            continue
 
+        text_lower = text.lower()
+
+        if any(
+            term in text_lower
+            for term in TREE_GOLD
+        ):
+
+            candidates.append(
+                text
+            )
+
+    if candidates:
+
+        # Prefer the longest useful
+        # description.
+        candidates.sort(
+            key=len,
+            reverse=True
+        )
+
+        return candidates[0]
 
     return ""
 
 
 # ============================================================
-# COUNCIL CLASSIFICATION
+# ADDRESS EXTRACTION
 # ============================================================
 
-def smart_classify(
+def extract_council_address(
+    record
+):
+
+    address = find_field_value(
+        record,
+        ADDRESS_FIELD_NAMES
+    )
+
+    if address:
+
+        return address
+
+    # Fallback to text containing
+    # a postcode.
+    for value in record.values():
+
+        if not isinstance(
+            value,
+            str
+        ):
+
+            continue
+
+        if extract_postcode(value):
+
+            return value.strip()
+
+    return ""
+
+
+# ============================================================
+# REFERENCE EXTRACTION
+# ============================================================
+
+def extract_application_reference(
+    record
+):
+
+    reference = find_field_value(
+        record,
+        REFERENCE_FIELD_NAMES
+    )
+
+    if reference:
+
+        return reference
+
+    # Search keys containing
+    # application/reference.
+    for key, value in record.items():
+
+        if value is None:
+
+            continue
+
+        key_lower = (
+            str(key).lower()
+        )
+
+        if (
+            "application" in key_lower
+            and
+            (
+                "number" in key_lower
+                or
+                "reference" in key_lower
+                or
+                "ref" in key_lower
+            )
+        ):
+
+            return str(value).strip()
+
+        if (
+            "reference" in key_lower
+            and
+            "url" not in key_lower
+        ):
+
+            return str(value).strip()
+
+    return ""
+
+
+# ============================================================
+# DATE PARSING
+# ============================================================
+
+def parse_date_value(
+    value
+):
+
+    if value is None:
+
+        return None
+
+    if isinstance(
+        value,
+        datetime
+    ):
+
+        if value.tzinfo is None:
+
+            return value.replace(
+                tzinfo=timezone.utc
+            )
+
+        return value
+
+    # ArcGIS sometimes returns
+    # milliseconds since epoch.
+    if isinstance(
+        value,
+        (int, float)
+    ):
+
+        try:
+
+            # milliseconds
+            if value > 100000000000:
+
+                return datetime.fromtimestamp(
+                    value / 1000,
+                    tz=timezone.utc
+                )
+
+            # seconds
+            return datetime.fromtimestamp(
+                value,
+                tz=timezone.utc
+            )
+
+        except Exception:
+
+            return None
+
+    text = str(
+        value
+    ).strip()
+
+    if not text:
+
+        return None
+
+    # ISO format.
+    try:
+
+        parsed = datetime.fromisoformat(
+            text.replace(
+                "Z",
+                "+00:00"
+            )
+        )
+
+        if parsed.tzinfo is None:
+
+            parsed = parsed.replace(
+                tzinfo=timezone.utc
+            )
+
+        return parsed
+
+    except Exception:
+
+        pass
+
+    formats = [
+        "%d/%m/%Y",
+        "%d/%m/%Y %H:%M:%S",
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S",
+        "%d-%m-%Y",
+        "%d-%m-%Y %H:%M:%S"
+    ]
+
+    for fmt in formats:
+
+        try:
+
+            return datetime.strptime(
+                text,
+                fmt
+            ).replace(
+                tzinfo=timezone.utc
+            )
+
+        except Exception:
+
+            continue
+
+    return None
+
+
+# ============================================================
+# DATE EXTRACTION
+# ============================================================
+
+def extract_council_date(
+    record
+):
+
+    # Prefer likely date fields.
+    for wanted in DATE_FIELD_NAMES:
+
+        for key, value in record.items():
+
+            if (
+                str(key).lower()
+                ==
+                wanted.lower()
+            ):
+
+                parsed = parse_date_value(
+                    value
+                )
+
+                if parsed:
+
+                    return parsed
+
+    # Fuzzy fallback.
+    for key, value in record.items():
+
+        key_lower = (
+            str(key).lower()
+        )
+
+        if (
+            "date" in key_lower
+            or
+            "received" in key_lower
+            or
+            "registered" in key_lower
+        ):
+
+            parsed = parse_date_value(
+                value
+            )
+
+            if parsed:
+
+                return parsed
+
+    return None
+
+
+# ============================================================
+# TREE MATCHING
+# ============================================================
+
+def get_tree_matches(
+    text
+):
+
+    if not text:
+
+        return []
+
+    text_lower = text.lower()
+
+    matches = []
+
+    for term in TREE_GOLD:
+
+        if term.lower() in text_lower:
+
+            matches.append(
+                term
+            )
+
+    return sorted(
+        set(matches)
+    )
+
+
+# ============================================================
+# TREE LEAD SCORING
+# ============================================================
+
+def score_tree_lead(
+    description,
+    matched_terms,
+    application_date
+):
+
+    if not description:
+
+        return 0
+
+    text = description.lower()
+
+    score = 0
+
+    # Base points for actual tree terms.
+    score += min(
+        len(matched_terms) * 5,
+        30
+    )
+
+    # Strong job terms.
+    strong_matches = []
+
+    for term in TREE_JOB_TERMS:
+
+        if term.lower() in text:
+
+            strong_matches.append(
+                term
+            )
+
+    score += min(
+        len(
+            set(strong_matches)
+        ) * 10,
+        40
+    )
+
+    # Explicit tree protection.
+    if "tpo" in text:
+
+        score += 15
+
+    # Recent application bonus.
+    if application_date:
+
+        now = datetime.now(
+            timezone.utc
+        )
+
+        age = (
+            now -
+            application_date
+        ).days
+
+        if age <= 30:
+
+            score += 20
+
+        elif age <= 90:
+
+            score += 15
+
+        elif age <= 180:
+
+            score += 10
+
+        elif age <= 365:
+
+            score += 5
+
+    return min(
+        score,
+        100
+    )
+
+
+# ============================================================
+# RECENT TEST
+# ============================================================
+
+def is_recent_application(
+    application_date
+):
+
+    if not application_date:
+
+        return False
+
+    cutoff = (
+        datetime.now(
+            timezone.utc
+        )
+        -
+        timedelta(
+            days=RECENT_DAYS
+        )
+    )
+
+    return application_date >= cutoff
+
+
+# ============================================================
+# BUILD PROFESSIONAL LEAD
+# ============================================================
+
+def build_council_lead(
     record
 ):
 
@@ -1423,110 +1887,536 @@ def smart_classify(
         )
     )
 
-
     if not description:
 
-        return (
-            False,
-            0,
-            ""
-        )
+        return None
 
-
-    text = description.lower()
-
-
-    matches = []
-
-
-    for word in TREE_GOLD:
-
-        if word in text:
-
-            matches.append(
-                word
-            )
-
-
-    if not matches:
-
-        return (
-            False,
-            0,
-            description
-        )
-
-
-    score = (
-        len(
-            set(matches)
-        )
-        * 5
-    )
-
-
-    if any(
-        x in text
-        for x in [
-            "fell",
-            "felling",
-            "tpo",
-            "remove",
-            "removal",
-            "pruning"
-        ]
-    ):
-
-        score += 15
-
-
-    return (
-        score >= 10,
-        score,
+    matched_terms = get_tree_matches(
         description
     )
 
+    if not matched_terms:
 
-# ============================================================
-# COUNCIL LEADS
-# ============================================================
+        return None
 
-def get_council_leads():
-
-    records, status = (
-        fetch_council()
+    address = (
+        extract_council_address(
+            record
+        )
     )
 
+    postcode = extract_postcode(
+        address
+    )
 
-    leads = []
+    reference = (
+        extract_application_reference(
+            record
+        )
+    )
+
+    application_date = (
+        extract_council_date(
+            record
+        )
+    )
+
+    recent = is_recent_application(
+        application_date
+    )
+
+    score = score_tree_lead(
+        description,
+        matched_terms,
+        application_date
+    )
+
+    # Reject very weak accidental matches.
+    if score < 10:
+
+        return None
+
+    source_url = ""
+
+    if reference:
+
+        source_url = (
+            "https://www.leeds.gov.uk/"
+            "planning"
+        )
+
+    return {
+        "council":
+            COUNCIL_NAME,
+
+        "source":
+            COUNCIL_SOURCE,
+
+        "application_reference":
+            reference,
+
+        "application_date":
+            (
+                application_date.isoformat()
+                if application_date
+                else None
+            ),
+
+        "address":
+            address,
+
+        "postcode":
+            postcode,
+
+        "summary":
+            description,
+
+        "matched_terms":
+            matched_terms,
+
+        "score":
+            score,
+
+        "recent":
+            recent,
+
+        "source_url":
+            source_url,
+
+        "raw_record":
+            record
+    }
 
 
-    for record in records:
+# ============================================================
+# SAVE COUNCIL LEAD
+# ============================================================
 
-        matched, score, description = (
-            smart_classify(
-                record
+def save_council_lead(
+    cur,
+    lead
+):
+
+    reference = (
+        lead.get(
+            "application_reference"
+        )
+        or ""
+    )
+
+    address = (
+        lead.get(
+            "address"
+        )
+        or ""
+    )
+
+    application_date = (
+        parse_date_value(
+            lead.get(
+                "application_date"
+            )
+        )
+    )
+
+    cur.execute(
+        """
+        SELECT id
+        FROM council_leads
+        WHERE council = %s
+        AND application_reference = %s
+        AND address = %s
+        LIMIT 1
+        """,
+        (
+            lead["council"],
+            reference,
+            address
+        )
+    )
+
+    existing = cur.fetchone()
+
+    if existing:
+
+        cur.execute(
+            """
+            UPDATE council_leads
+            SET
+                application_date = %s,
+                postcode = %s,
+                summary = %s,
+                matched_terms = %s,
+                score = %s,
+                recent = %s,
+                source_url = %s,
+                raw_record = %s,
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (
+                application_date,
+                lead.get("postcode"),
+                lead.get("summary"),
+                lead.get("matched_terms"),
+                lead.get("score"),
+                lead.get("recent"),
+                lead.get("source_url"),
+                psycopg2.extras.Json(
+                    lead.get(
+                        "raw_record",
+                        {}
+                    )
+                ),
+                existing[0]
             )
         )
 
+        return "updated"
 
-        if not matched:
-
-            continue
-
-
-        leads.append({
-            "score": score,
-            "summary": description,
-            "record": record
-        })
-
-
-    return (
-        records,
-        status,
-        leads
+    cur.execute(
+        """
+        INSERT INTO council_leads (
+            council,
+            source,
+            application_reference,
+            application_date,
+            address,
+            postcode,
+            summary,
+            matched_terms,
+            score,
+            recent,
+            source_url,
+            raw_record,
+            created_at,
+            updated_at
+        )
+        VALUES (
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            NOW(),
+            NOW()
+        )
+        """,
+        (
+            lead["council"],
+            lead["source"],
+            reference,
+            application_date,
+            address,
+            lead.get("postcode"),
+            lead.get("summary"),
+            lead.get("matched_terms"),
+            lead.get("score"),
+            lead.get("recent"),
+            lead.get("source_url"),
+            psycopg2.extras.Json(
+                lead.get(
+                    "raw_record",
+                    {}
+                )
+            )
+        )
     )
+
+    return "new"
+
+
+# ============================================================
+# COUNCIL LEAD DISCOVERY
+# ============================================================
+
+def discover_council_leads():
+
+    stats = {
+        "status": "success",
+        "records_downloaded": 0,
+        "tree_related_records": 0,
+        "recent_tree_leads": 0,
+        "old_tree_records": 0,
+        "records_without_dates": 0,
+        "new_leads": 0,
+        "updated_leads": 0,
+        "strong_leads": 0,
+        "leads": []
+    }
+
+    records, council_status = (
+        fetch_council()
+    )
+
+    stats[
+        "council_status"
+    ] = council_status
+
+    stats[
+        "records_downloaded"
+    ] = len(records)
+
+    if not SURL:
+
+        stats[
+            "status"
+        ] = "error"
+
+        stats[
+            "error"
+        ] = "SUPABASE_DB_URL missing"
+
+        return stats
+
+    try:
+
+        conn = psycopg2.connect(
+            SURL
+        )
+
+        cur = conn.cursor()
+
+        discovered = []
+
+        for record in records:
+
+            lead = build_council_lead(
+                record
+            )
+
+            if not lead:
+
+                continue
+
+            stats[
+                "tree_related_records"
+            ] += 1
+
+            if lead["recent"]:
+
+                stats[
+                    "recent_tree_leads"
+                ] += 1
+
+            else:
+
+                application_date = (
+                    lead.get(
+                        "application_date"
+                    )
+                )
+
+                if application_date:
+
+                    stats[
+                        "old_tree_records"
+                    ] += 1
+
+            if not lead.get(
+                "application_date"
+            ):
+
+                stats[
+                    "records_without_dates"
+                ] += 1
+
+            if lead["score"] >= 50:
+
+                stats[
+                    "strong_leads"
+                ] += 1
+
+            result = save_council_lead(
+                cur,
+                lead
+            )
+
+            if result == "new":
+
+                stats[
+                    "new_leads"
+                ] += 1
+
+            elif result == "updated":
+
+                stats[
+                    "updated_leads"
+                ] += 1
+
+            discovered.append(
+                lead
+            )
+
+        conn.commit()
+
+        cur.close()
+
+        conn.close()
+
+        # Highest-quality and most recent first.
+        discovered.sort(
+            key=lambda x: (
+                x.get("recent", False),
+                x.get("score", 0),
+                x.get(
+                    "application_date"
+                ) or ""
+            ),
+            reverse=True
+        )
+
+        # Return only a manageable sample
+        # to the browser.
+        stats[
+            "leads"
+        ] = discovered[:50]
+
+        return stats
+
+    except Exception as e:
+
+        logger.exception(
+            "Council lead database error"
+        )
+
+        stats[
+            "status"
+        ] = "error"
+
+        stats[
+            "error"
+        ] = str(e)
+
+        return stats
+
+
+# ============================================================
+# COMPLETE BACKGROUND RESEARCH
+# ============================================================
+
+def perform_full_research():
+
+    logger.info(
+        "BACKGROUND RESEARCH STARTED"
+    )
+
+    try:
+
+        business_result = (
+            discover_leeds_partners()
+        )
+
+        council_result = (
+            discover_council_leads()
+        )
+
+        result = {
+            "business_discovery":
+                business_result,
+
+            "council_lead_discovery":
+                council_result
+        }
+
+        with research_lock:
+
+            research_state[
+                "running"
+            ] = False
+
+            research_state[
+                "finished_at"
+            ] = datetime.now(
+                timezone.utc
+            ).isoformat()
+
+            research_state[
+                "last_result"
+            ] = result
+
+            research_state[
+                "error"
+            ] = None
+
+        logger.info(
+            "BACKGROUND RESEARCH FINISHED"
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "BACKGROUND RESEARCH FAILED"
+        )
+
+        with research_lock:
+
+            research_state[
+                "running"
+            ] = False
+
+            research_state[
+                "finished_at"
+            ] = datetime.now(
+                timezone.utc
+            ).isoformat()
+
+            research_state[
+                "error"
+            ] = str(e)
+
+
+# ============================================================
+# START BACKGROUND RESEARCH
+# ============================================================
+
+def start_research():
+
+    with research_lock:
+
+        if research_state[
+            "running"
+        ]:
+
+            return False
+
+        research_state[
+            "running"
+        ] = True
+
+        research_state[
+            "started_at"
+        ] = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+        research_state[
+            "finished_at"
+        ] = None
+
+        research_state[
+            "last_result"
+        ] = None
+
+        research_state[
+            "error"
+        ] = None
+
+    worker = threading.Thread(
+        target=perform_full_research,
+        daemon=True
+    )
+
+    worker.start()
+
+    return True
 
 
 # ============================================================
@@ -1548,6 +2438,12 @@ def lander():
             Vector Data Labs
         </title>
 
+        <meta
+            name="viewport"
+            content="width=device-width,
+            initial-scale=1"
+        >
+
     </head>
 
     <body style="
@@ -1562,7 +2458,8 @@ def lander():
             padding:45px;
             background:white;
             border-radius:15px;
-            box-shadow:0 10px 30px
+            box-shadow:
+                0 10px 30px
                 rgba(0,0,0,0.1);
             border-top:6px solid #1b5e20;
             max-width:700px;
@@ -1575,7 +2472,7 @@ def lander():
             </h1>
 
             <h2>
-                V83.0 Leeds Discovery
+                V84.0 Leeds Lead Finder
             </h2>
 
             <div style="
@@ -1585,36 +2482,23 @@ def lander():
                 margin:20px 0;
                 text-align:left;
                 font-size:14px;
+                line-height:1.7;
             ">
 
-                <b>
-                    Business source:
-                </b>
-                Companies House
-                <br>
+                <b>Business discovery:</b>
+                Companies House<br>
 
-                <b>
-                    Core area:
-                </b>
-                Leeds LS postcodes
-                <br>
+                <b>Business area:</b>
+                Leeds + 15 miles<br>
 
-                <b>
-                    Extended area:
-                </b>
-                15-mile radius
-                <br>
+                <b>Lead source:</b>
+                Leeds City Council<br>
 
-                <b>
-                    Tree searches:
-                </b>
-                11 search categories
-                <br>
+                <b>Lead type:</b>
+                Tree-related planning applications<br>
 
-                <b>
-                    Research:
-                </b>
-                Background processing
+                <b>Lead storage:</b>
+                Supabase
 
             </div>
 
@@ -1628,36 +2512,35 @@ def lander():
                 border-radius:5px;
                 font-weight:bold;
             ">
-
-                Start Leeds Research
-
+                Run Leeds Research
             </a>
 
             <br><br>
 
             <a href="/research-status"
                style="color:#555;">
+                Check Research Status
+            </a>
 
-                View Research Status
+            <br><br>
 
+            <a href="/council-leads"
+               style="color:#555;">
+                View Stored Council Leads
             </a>
 
             <br><br>
 
             <a href="/test-regional"
                style="color:#555;">
-
-                Test Leeds Council Leads
-
+                Run Council Test
             </a>
 
             <br><br>
 
             <a href="/docs"
                style="color:#555;">
-
                 API Documentation
-
             </a>
 
         </div>
@@ -1669,7 +2552,7 @@ def lander():
 
 
 # ============================================================
-# START BUSINESS RESEARCH
+# START FULL RESEARCH
 # ============================================================
 
 @app.get(
@@ -1679,7 +2562,6 @@ def run_discovery():
 
     started = start_research()
 
-
     if not started:
 
         return {
@@ -1687,23 +2569,22 @@ def run_discovery():
                 "already_running",
 
             "message":
-                "Leeds business research "
-                "is already running in "
-                "the background.",
+                "Leeds business and council "
+                "research is already running "
+                "in the background.",
 
             "check":
                 "/research-status"
         }
-
 
     return {
         "status":
             "started",
 
         "message":
-            "Leeds business research "
-            "has started in the "
-            "background.",
+            "Leeds business and council "
+            "research has started in "
+            "the background.",
 
         "check":
             "/research-status"
@@ -1719,52 +2600,42 @@ def run_discovery():
 )
 def research_status():
 
-    if research_running:
+    with research_lock:
 
         return {
             "status":
-                "running",
+                "running"
+                if research_state[
+                    "running"
+                ]
+                else
+                "finished",
+
+            "running":
+                research_state[
+                    "running"
+                ],
 
             "started_at":
-                research_started_at,
+                research_state[
+                    "started_at"
+                ],
 
-            "message":
-                "Research is currently "
-                "running.",
+            "finished_at":
+                research_state[
+                    "finished_at"
+                ],
 
-            "check_again":
-                "/research-status"
+            "error":
+                research_state[
+                    "error"
+                ],
+
+            "last_result":
+                research_state[
+                    "last_result"
+                ]
         }
-
-
-    if latest_research_result is None:
-
-        return {
-            "status":
-                "idle",
-
-            "message":
-                "No research run has "
-                "completed yet.",
-
-            "start":
-                "/research-leeds"
-        }
-
-
-    return {
-        "status":
-            "finished",
-
-        "started_at":
-            research_started_at,
-
-        "finished_at":
-            research_finished_at,
-
-        "results":
-            latest_research_result
-    }
 
 
 # ============================================================
@@ -1776,31 +2647,202 @@ def research_status():
 )
 def test_leeds():
 
-    records, status, leads = (
-        get_council_leads()
-    )
-
+    result = discover_council_leads()
 
     return {
         "council":
             "Leeds",
 
-        "status":
-            status,
+        "source":
+            "Leeds City Council",
 
         "records_checked":
-            len(records),
+            result.get(
+                "records_downloaded",
+                0
+            ),
 
-        "leads_detected":
-            len(leads),
+        "tree_related_records":
+            result.get(
+                "tree_related_records",
+                0
+            ),
+
+        "recent_tree_leads":
+            result.get(
+                "recent_tree_leads",
+                0
+            ),
+
+        "strong_leads":
+            result.get(
+                "strong_leads",
+                0
+            ),
+
+        "new_leads":
+            result.get(
+                "new_leads",
+                0
+            ),
+
+        "updated_leads":
+            result.get(
+                "updated_leads",
+                0
+            ),
 
         "leads":
-            leads
+            result.get(
+                "leads",
+                []
+            )
     }
 
 
 # ============================================================
-# HEALTH
+# VIEW STORED COUNCIL LEADS
+# ============================================================
+
+@app.get(
+    "/council-leads"
+)
+def council_leads():
+
+    if not SURL:
+
+        return {
+            "status":
+                "error",
+
+            "message":
+                "SUPABASE_DB_URL missing"
+        }
+
+    try:
+
+        conn = psycopg2.connect(
+            SURL
+        )
+
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT
+                council,
+                source,
+                application_reference,
+                application_date,
+                address,
+                postcode,
+                summary,
+                matched_terms,
+                score,
+                recent,
+                source_url,
+                created_at,
+                updated_at
+            FROM council_leads
+            ORDER BY
+                recent DESC,
+                score DESC,
+                application_date DESC NULLS LAST
+            LIMIT 100
+            """
+        )
+
+        rows = cur.fetchall()
+
+        cur.close()
+
+        conn.close()
+
+        leads = []
+
+        for row in rows:
+
+            leads.append({
+                "council":
+                    row[0],
+
+                "source":
+                    row[1],
+
+                "application_reference":
+                    row[2],
+
+                "application_date":
+                    (
+                        row[3].isoformat()
+                        if row[3]
+                        else None
+                    ),
+
+                "address":
+                    row[4],
+
+                "postcode":
+                    row[5],
+
+                "summary":
+                    row[6],
+
+                "matched_terms":
+                    row[7],
+
+                "score":
+                    row[8],
+
+                "recent":
+                    row[9],
+
+                "source_url":
+                    row[10],
+
+                "created_at":
+                    (
+                        row[11].isoformat()
+                        if row[11]
+                        else None
+                    ),
+
+                "updated_at":
+                    (
+                        row[12].isoformat()
+                        if row[12]
+                        else None
+                    )
+            })
+
+        return {
+            "status":
+                "success",
+
+            "count":
+                len(leads),
+
+            "leads":
+                leads
+        }
+
+    except Exception as e:
+
+        logger.exception(
+            "Unable to retrieve council leads"
+        )
+
+        return {
+            "status":
+                "error",
+
+            "message":
+                str(e)
+        }
+
+
+# ============================================================
+# HEALTH CHECK
 # ============================================================
 
 @app.get(
@@ -1813,7 +2855,7 @@ def health():
             "online",
 
         "version":
-            "83.0",
+            "84.0",
 
         "database_configured":
             bool(SURL),
@@ -1824,19 +2866,26 @@ def health():
         "service_area_miles":
             SERVICE_RADIUS_MILES,
 
+        "council":
+            COUNCIL_NAME,
+
+        "recent_lead_window_days":
+            RECENT_DAYS,
+
         "research_running":
-            research_running
+            research_state[
+                "running"
+            ]
     }
 
 
 # ============================================================
-# LOCAL RUN
+# RUN LOCALLY
 # ============================================================
 
 if __name__ == "__main__":
 
     import uvicorn
-
 
     port = int(
         os.getenv(
@@ -1844,7 +2893,6 @@ if __name__ == "__main__":
             "10000"
         )
     )
-
 
     uvicorn.run(
         app,
