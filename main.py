@@ -8,18 +8,18 @@ import time
 import math
 
 from datetime import datetime, timezone
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
 # ============================================================
 # VECTOR DATA LABS
-# V82.0 - LEEDS + 15 MILE SERVICE AREA
+# V82.0 - LEEDS + 15 MILE SERVICE AREA DISCOVERY
 # ============================================================
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = FastAPI(
-    title="Vector Data Labs - V82 Leeds Lead Discovery",
+    title="Vector Data Labs - V82.0 Leeds Discovery Master",
     docs_url="/docs"
 )
 
@@ -32,34 +32,10 @@ logger = logging.getLogger("vector-data-labs")
 # ============================================================
 
 SURL = os.getenv("SUPABASE_DB_URL")
-T_SEC = os.getenv("TRIGGER_SECRET")
 CH_KEY = os.getenv("COMPANIES_HOUSE_KEY")
 
+COMPANIES_HOUSE_URL = "https://api.company-information.service.gov.uk"
 
-# ============================================================
-# API SETTINGS
-# ============================================================
-
-COMPANIES_HOUSE_URL = (
-    "https://api.company-information.service.gov.uk"
-)
-
-POSTCODES_IO_URL = "https://api.postcodes.io"
-
-LEEDS_COUNCIL_URL = (
-    "https://mapservices.leeds.gov.uk/"
-    "arcgis/rest/services/Public/Planning/MapServer/12/query"
-)
-
-# Leeds city-centre reference point.
-# Used only for calculating the commercial service radius.
-LEEDS_LAT = 53.8008
-LEEDS_LON = -1.5491
-
-# Commercial service radius.
-SERVICE_RADIUS_MILES = 15.0
-
-# Companies House search settings.
 SEARCH_TERMS = [
     "tree",
     "tree services",
@@ -77,281 +53,258 @@ SEARCH_TERMS = [
 ITEMS_PER_PAGE = 50
 MAX_RESULTS_PER_TERM = 200
 
-# Be polite to external services.
 REQUEST_DELAY = 0.25
 
-# Postcodes.io allows batch postcode lookups.
-POSTCODE_BATCH_SIZE = 100
+# Leeds service radius
+SERVICE_RADIUS_MILES = 15.0
+
+# Leeds approximate centre
+LEEDS_LAT = 53.8008
+LEEDS_LON = -1.5491
 
 
 # ============================================================
-# LEEDS POSTCODE CORE
+# TREE CLASSIFICATION
 # ============================================================
 
-# The LS postcode area contains geographic districts plus
-# non-geographic LS88, LS98 and LS99.
-#
-# We treat geographic LS districts as the Leeds CORE.
-# Non-geographic LS districts are deliberately excluded.
-
-LS_CORE_DISTRICTS = {
-    "LS1", "LS2", "LS3", "LS4", "LS5", "LS6", "LS7", "LS8",
-    "LS9", "LS10", "LS11", "LS12", "LS13", "LS14", "LS15",
-    "LS16", "LS17", "LS18", "LS19", "LS20", "LS21", "LS22",
-    "LS23", "LS24", "LS25", "LS26", "LS27", "LS28", "LS29"
-}
-
-NON_GEOGRAPHIC_LS = {
-    "LS88", "LS98", "LS99"
-}
-
-
-# ============================================================
-# TREE DISCOVERY TERMS
-# ============================================================
-
-TREE_NAME_TERMS = [
+TREE_TERMS = [
     "tree",
     "trees",
-    "tree surgeon",
-    "tree surgery",
-    "tree service",
-    "tree services",
-    "tree care",
+    "arbor",
     "arborist",
     "arboriculture",
     "forestry",
-    "stump",
-    "stump grinding",
     "woodland",
-    "grounds",
-    "landscap"
-]
-
-
-# ============================================================
-# COUNCIL CLASSIFICATION
-# ============================================================
-
-TREE_GOLD = [
-    "tree",
-    "tpo",
-    "fell",
-    "felling",
-    "arboriculture",
-    "arborist",
-    "crown",
-    "pruning",
-    "prune",
     "stump",
-    "oak",
-    "ash",
-    "willow",
-    "cedar",
-    "sycamore",
-    "beech",
-    "conifer",
-    "woodland"
-]
-
-COUNCIL_DESCRIPTION_HEADERS = [
-    "proposal",
-    "description",
-    "development_description",
-    "nature",
-    "details",
-    "development",
-    "application_description",
-    "applicationdetails",
-    "siteAddress",
-    "address"
+    "treecare",
+    "tree care",
+    "tree surgeon",
+    "tree surgery",
+    "tree services",
+    "tree service",
+    "tree felling",
+    "tree removal"
 ]
 
 
 # ============================================================
-# DATABASE SETUP
+# DATABASE SETUP + MIGRATION
 # ============================================================
-
-def get_db_connection():
-    if not SURL:
-        raise RuntimeError("SUPABASE_DB_URL missing")
-
-    return psycopg2.connect(SURL)
-
 
 def init_db():
+
     if not SURL:
-        logger.warning("SUPABASE_DB_URL missing - database disabled")
+        logger.error("SUPABASE_DB_URL is missing.")
         return
 
     try:
-        conn = get_db_connection()
+
+        conn = psycopg2.connect(SURL)
         cur = conn.cursor()
 
-        # Main company discovery table.
+        # Base table
         cur.execute("""
             CREATE TABLE IF NOT EXISTS potential_partners (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-
                 company_name TEXT,
                 company_number TEXT UNIQUE,
-
                 status TEXT,
-
                 date_incorporated DATE,
-
                 address TEXT,
-                postcode TEXT,
-
-                latitude DOUBLE PRECISION,
-                longitude DOUBLE PRECISION,
-
-                distance_from_leeds_miles DOUBLE PRECISION,
-
-                service_area TEXT,
-
                 operational_confidence INT DEFAULT 0,
-
-                sic_codes TEXT[],
-
-                discovery_source TEXT,
-
-                companies_house_url TEXT,
-
-                last_verified TIMESTAMPTZ,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
-                updated_at TIMESTAMPTZ DEFAULT NOW()
+                sic_codes TEXT[],
+                discovery_source TEXT,
+                companies_house_url TEXT,
+                last_verified TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ
             );
         """)
 
-        # Council lead table.
+        # ----------------------------------------------------
+        # IMPORTANT:
+        # Existing databases may already have the table.
+        # Therefore we add new columns safely with IF NOT EXISTS.
+        # ----------------------------------------------------
+
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS council_tree_leads (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            ALTER TABLE potential_partners
+            ADD COLUMN IF NOT EXISTS postcode TEXT;
+        """)
 
-                council TEXT,
+        cur.execute("""
+            ALTER TABLE potential_partners
+            ADD COLUMN IF NOT EXISTS distance_from_leeds_miles NUMERIC;
+        """)
 
-                application_reference TEXT,
+        cur.execute("""
+            ALTER TABLE potential_partners
+            ADD COLUMN IF NOT EXISTS service_area TEXT;
+        """)
 
-                received_date DATE,
+        cur.execute("""
+            ALTER TABLE potential_partners
+            ADD COLUMN IF NOT EXISTS tree_related_name BOOLEAN DEFAULT FALSE;
+        """)
 
-                decision_date DATE,
-
-                status TEXT,
-
-                address TEXT,
-
-                postcode TEXT,
-
-                summary TEXT,
-
-                full_description TEXT,
-
-                latitude DOUBLE PRECISION,
-                longitude DOUBLE PRECISION,
-
-                distance_from_leeds_miles DOUBLE PRECISION,
-
-                service_area TEXT,
-
-                source_url TEXT,
-
-                source TEXT,
-
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-                updated_at TIMESTAMPTZ DEFAULT NOW(),
-
-                UNIQUE(council, application_reference)
-            );
+        cur.execute("""
+            ALTER TABLE potential_partners
+            ADD COLUMN IF NOT EXISTS search_term TEXT;
         """)
 
         conn.commit()
+
         cur.close()
         conn.close()
 
-        logger.info("Database schema verified.")
+        logger.info("Database schema verified and migrated.")
 
     except Exception as e:
-        logger.error(f"Database schema error: {e}")
+
+        logger.error(f"Database migration error: {e}")
 
 
 init_db()
 
 
 # ============================================================
-# GENERAL HELPERS
+# HTTP SESSION
 # ============================================================
 
-def clean_text(value):
-    if value is None:
-        return ""
+def get_ch_session():
 
-    return re.sub(
-        r"\s+",
-        " ",
-        str(value)
-    ).strip()
+    session = requests.Session()
+
+    session.auth = (CH_KEY, "")
+
+    session.headers.update({
+        "User-Agent": "VectorDataLabs/82.0"
+    })
+
+    return session
 
 
-def normalize_postcode(postcode):
-    if not postcode:
+# ============================================================
+# POSTCODE CLEANING
+# ============================================================
+
+def clean_postcode(value):
+
+    if not value:
         return None
 
-    postcode = str(postcode).upper().strip()
+    value = str(value).upper().strip()
 
-    postcode = re.sub(
-        r"\s+",
-        "",
-        postcode
-    )
+    # Remove commas and repeated whitespace
+    value = re.sub(r"[^A-Z0-9 ]", "", value)
+    value = re.sub(r"\s+", " ", value)
 
-    # Basic UK postcode validation.
-    pattern = r"^[A-Z]{1,2}\d[A-Z\d]?\d[A-Z]{2}$"
-
-    if not re.match(pattern, postcode):
-        return None
-
-    return postcode
-
-
-def postcode_district(postcode):
-    postcode = normalize_postcode(postcode)
-
-    if not postcode:
-        return None
-
-    match = re.match(
-        r"^([A-Z]{1,2}\d{1,2})",
-        postcode
+    # UK postcode pattern
+    match = re.search(
+        r"\b([A-Z]{1,2}\d[A-Z\d]?)\s?(\d[A-Z]{2})\b",
+        value
     )
 
     if not match:
         return None
 
-    return match.group(1)
+    return f"{match.group(1)}{match.group(2)}"
 
 
-def haversine_miles(lat1, lon1, lat2, lon2):
-    """
-    Calculate great-circle distance in miles.
-    """
+# ============================================================
+# EXTRACT POSTCODE FROM ADDRESS
+# ============================================================
 
-    radius_miles = 3958.7613
+def extract_postcode(address):
+
+    if not address:
+        return None
+
+    address = str(address).upper()
+
+    match = re.search(
+        r"\b([A-Z]{1,2}\d[A-Z\d]?)\s?(\d[A-Z]{2})\b",
+        address
+    )
+
+    if not match:
+        return None
+
+    return f"{match.group(1)}{match.group(2)}"
+
+
+# ============================================================
+# POSTCODE -> APPROXIMATE COORDINATES
+#
+# Uses postcodes.io public API.
+# ============================================================
+
+def postcode_coordinates(session, postcode):
+
+    if not postcode:
+        return None, None
+
+    try:
+
+        url = (
+            "https://api.postcodes.io/postcodes/"
+            + postcode
+        )
+
+        response = session.get(
+            url,
+            timeout=10
+        )
+
+        if response.status_code != 200:
+            return None, None
+
+        data = response.json()
+
+        result = data.get("result")
+
+        if not result:
+            return None, None
+
+        lat = result.get("latitude")
+        lon = result.get("longitude")
+
+        if lat is None or lon is None:
+            return None, None
+
+        return float(lat), float(lon)
+
+    except Exception as e:
+
+        logger.warning(
+            f"Postcode lookup failed for {postcode}: {e}"
+        )
+
+        return None, None
+
+
+# ============================================================
+# HAVERSINE DISTANCE
+# ============================================================
+
+def distance_miles(lat1, lon1, lat2, lon2):
+
+    earth_radius_km = 6371.0
 
     lat1 = math.radians(lat1)
-    lon1 = math.radians(lon1)
     lat2 = math.radians(lat2)
-    lon2 = math.radians(lon2)
 
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
+    delta_lat = math.radians(lat2 - lat1)
+    delta_lon = math.radians(lon2 - lon1)
 
     a = (
-        math.sin(dlat / 2) ** 2
+        math.sin(delta_lat / 2) ** 2
         +
         math.cos(lat1)
-        * math.cos(lat2)
-        * math.sin(dlon / 2) ** 2
+        *
+        math.cos(lat2)
+        *
+        math.sin(delta_lon / 2) ** 2
     )
 
     c = 2 * math.atan2(
@@ -359,318 +312,180 @@ def haversine_miles(lat1, lon1, lat2, lon2):
         math.sqrt(1 - a)
     )
 
-    return radius_miles * c
+    kilometres = earth_radius_km * c
+
+    return kilometres * 0.621371
 
 
 # ============================================================
-# POSTCODE DISTANCE ENGINE
+# LEEDS CORE TEST
+#
+# LS postcode district = Leeds area.
+# We use LS + valid postcode structure rather than merely
+# searching for the letters "LS".
 # ============================================================
 
-def classify_postcode(postcode):
-    """
-    Returns basic geographical classification before
-    coordinate verification.
-
-    LS geographic districts are always considered CORE.
-
-    Non-LS districts must subsequently pass the
-    15-mile distance test.
-    """
-
-    postcode = normalize_postcode(postcode)
+def is_leeds_core_postcode(postcode):
 
     if not postcode:
-        return {
-            "valid": False,
-            "district": None,
-            "area": None,
-            "service_area": None
-        }
+        return False
 
-    district = postcode_district(postcode)
+    postcode = postcode.upper().replace(" ", "")
 
-    if not district:
-        return {
-            "valid": False,
-            "district": None,
-            "area": None,
-            "service_area": None
-        }
-
-    area_match = re.match(
-        r"^([A-Z]{1,2})",
-        district
-    )
-
-    area = area_match.group(1) if area_match else None
-
-    if district in LS_CORE_DISTRICTS:
-        return {
-            "valid": True,
-            "district": district,
-            "area": area,
-            "service_area": "Leeds Core"
-        }
-
-    if district in NON_GEOGRAPHIC_LS:
-        return {
-            "valid": False,
-            "district": district,
-            "area": area,
-            "service_area": None
-        }
-
-    return {
-        "valid": True,
-        "district": district,
-        "area": area,
-        "service_area": "Distance Verified"
-    }
-
-
-def batch_postcode_coordinates(postcodes):
-    """
-    Batch postcode lookups through Postcodes.io.
-
-    This is much better than making one HTTP request for
-    every company individually.
-    """
-
-    unique = []
-
-    for postcode in postcodes:
-        postcode = normalize_postcode(postcode)
-
-        if postcode and postcode not in unique:
-            unique.append(postcode)
-
-    results = {}
-
-    if not unique:
-        return results
-
-    session = requests.Session()
-
-    for start in range(
-        0,
-        len(unique),
-        POSTCODE_BATCH_SIZE
-    ):
-
-        batch = unique[
-            start:start + POSTCODE_BATCH_SIZE
-        ]
-
-        try:
-            response = session.post(
-                f"{POSTCODES_IO_URL}/postcodes",
-                json={
-                    "postcodes": batch
-                },
-                timeout=30
-            )
-
-            if response.status_code != 200:
-                logger.warning(
-                    f"Postcodes.io error: "
-                    f"{response.status_code}"
-                )
-
-                continue
-
-            data = response.json()
-
-            for result in data.get(
-                "result",
-                []
-            ):
-
-                query = normalize_postcode(
-                    result.get("query")
-                )
-
-                if not query:
-                    continue
-
-                if result.get("result") is None:
-                    continue
-
-                geo = result["result"]
-
-                lat = geo.get("latitude")
-                lon = geo.get("longitude")
-
-                if lat is None or lon is None:
-                    continue
-
-                results[query] = {
-                    "latitude": float(lat),
-                    "longitude": float(lon)
-                }
-
-        except Exception as e:
-            logger.warning(
-                f"Postcode lookup error: {e}"
-            )
-
-        time.sleep(REQUEST_DELAY)
-
-    return results
-
-
-def calculate_service_area(postcode, coordinates):
-    """
-    Decide whether a postcode is commercially usable.
-
-    LS geographic postcodes = Leeds Core.
-
-    Everything outside LS must actually be within
-    SERVICE_RADIUS_MILES of Leeds.
-    """
-
-    info = classify_postcode(postcode)
-
-    if not info["valid"]:
-        return {
-            "accepted": False,
-            "service_area": None,
-            "distance_miles": None
-        }
-
-    # All geographic LS districts are accepted as the
-    # Leeds core.
-    if info["service_area"] == "Leeds Core":
-
-        if not coordinates:
-            return {
-                "accepted": True,
-                "service_area": "Leeds Core",
-                "distance_miles": None
-            }
-
-        distance = haversine_miles(
-            LEEDS_LAT,
-            LEEDS_LON,
-            coordinates["latitude"],
-            coordinates["longitude"]
+    return bool(
+        re.match(
+            r"^LS\d{1,2}[A-Z]{2}$",
+            postcode
         )
-
-        return {
-            "accepted": True,
-            "service_area": "Leeds Core",
-            "distance_miles": round(distance, 2)
-        }
-
-    # Non-LS postcodes require an actual coordinate check.
-    if not coordinates:
-        return {
-            "accepted": False,
-            "service_area": None,
-            "distance_miles": None
-        }
-
-    distance = haversine_miles(
-        LEEDS_LAT,
-        LEEDS_LON,
-        coordinates["latitude"],
-        coordinates["longitude"]
     )
-
-    if distance <= SERVICE_RADIUS_MILES:
-        return {
-            "accepted": True,
-            "service_area": "Leeds 15 Mile Radius",
-            "distance_miles": round(distance, 2)
-        }
-
-    return {
-        "accepted": False,
-        "service_area": None,
-        "distance_miles": round(distance, 2)
-    }
 
 
 # ============================================================
-# TREE BUSINESS CLASSIFICATION
+# TREE COMPANY NAME TEST
 # ============================================================
 
 def name_looks_tree_related(name):
+
     if not name:
         return False
 
-    name = clean_text(name).lower()
+    name = name.lower()
 
     return any(
         term in name
-        for term in TREE_NAME_TERMS
+        for term in TREE_TERMS
     )
 
 
-def calculate_company_confidence(
-    company_name,
+# ============================================================
+# SERVICE AREA CLASSIFICATION
+# ============================================================
+
+def classify_service_area(distance):
+
+    if distance is None:
+        return "Unknown"
+
+    if distance <= 15:
+        return "Leeds 15 Mile Service Area"
+
+    return "Outside Service Area"
+
+
+# ============================================================
+# SAVE COMPANY
+# ============================================================
+
+def save_partner(
+    cur,
+    company,
     address,
+    postcode,
+    distance,
     service_area,
-    status
+    tree_related_name,
+    search_term
 ):
-    score = 0
 
-    if status == "active":
-        score += 30
+    company_number = company.get("company_number")
 
-    if service_area == "Leeds Core":
-        score += 25
-    elif service_area == "Leeds 15 Mile Radius":
-        score += 20
+    if not company_number:
+        return "invalid"
 
-    if name_looks_tree_related(company_name):
-        score += 35
+    cur.execute(
+        """
+        SELECT 1
+        FROM potential_partners
+        WHERE company_number = %s
+        """,
+        (company_number,)
+    )
 
-    address_lower = clean_text(
-        address
-    ).lower()
+    if cur.fetchone():
 
-    if any(
-        term in address_lower
-        for term in [
-            "tree",
-            "arbor",
-            "forestry",
-            "stump",
-            "landscape"
-        ]
-    ):
-        score += 10
-
-    return min(score, 100)
-
-
-# ============================================================
-# COMPANIES HOUSE SESSION
-# ============================================================
-
-def get_ch_session():
-
-    if not CH_KEY:
-        raise RuntimeError(
-            "COMPANIES_HOUSE_KEY missing"
+        # Update verification/geographical information
+        cur.execute(
+            """
+            UPDATE potential_partners
+            SET
+                status = %s,
+                address = %s,
+                postcode = %s,
+                distance_from_leeds_miles = %s,
+                service_area = %s,
+                tree_related_name = %s,
+                last_verified = NOW(),
+                updated_at = NOW()
+            WHERE company_number = %s
+            """,
+            (
+                company.get("company_status"),
+                address,
+                postcode,
+                distance,
+                service_area,
+                tree_related_name,
+                company_number
+            )
         )
 
-    session = requests.Session()
+        return "duplicate"
 
-    # Companies House uses the API key as the username
-    # with an empty password.
-    session.auth = (
-        CH_KEY,
-        ""
+    cur.execute(
+        """
+        INSERT INTO potential_partners (
+            company_name,
+            company_number,
+            status,
+            date_incorporated,
+            address,
+            postcode,
+            distance_from_leeds_miles,
+            service_area,
+            tree_related_name,
+            operational_confidence,
+            discovery_source,
+            companies_house_url,
+            last_verified,
+            updated_at,
+            search_term
+        )
+        VALUES (
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            NOW(),
+            NOW(),
+            %s
+        )
+        """,
+        (
+            company.get("title"),
+            company_number,
+            company.get("company_status"),
+            company.get("date_of_creation"),
+            address,
+            postcode,
+            distance,
+            service_area,
+            tree_related_name,
+            50,
+            "Companies House Leeds 15 Mile Discovery",
+            f"https://find-and-update.company-information.service.gov.uk/company/{company_number}",
+            search_term
+        )
     )
 
-    session.headers.update({
-        "User-Agent":
-            "VectorDataLabs/82.0 "
-            "(Leeds tree-services discovery)"
-    })
-
-    return session
+    return "new"
 
 
 # ============================================================
@@ -713,443 +528,288 @@ def discover_leeds_partners():
 
     session = get_ch_session()
 
+    # Avoid looking up the same postcode hundreds of times.
+    postcode_cache = {}
+
     seen_in_run = set()
-    companies_to_process = []
-
-    # --------------------------------------------------------
-    # STEP 1
-    # Search Companies House and collect candidates.
-    # --------------------------------------------------------
-
-    for term in SEARCH_TERMS:
-
-        stats["search_terms"] += 1
-
-        logger.info(
-            f"Searching Companies House for: {term}"
-        )
-
-        start_index = 0
-
-        while start_index < MAX_RESULTS_PER_TERM:
-
-            try:
-
-                response = session.get(
-                    f"{COMPANIES_HOUSE_URL}/search/companies",
-                    params={
-                        "q": term,
-                        "items_per_page": ITEMS_PER_PAGE,
-                        "start_index": start_index
-                    },
-                    timeout=20
-                )
-
-            except Exception as e:
-
-                stats["api_errors"] += 1
-
-                logger.error(
-                    f"Companies House request error "
-                    f"for '{term}': {e}"
-                )
-
-                break
-
-            if response.status_code != 200:
-
-                stats["api_errors"] += 1
-
-                logger.error(
-                    f"Companies House returned "
-                    f"{response.status_code} "
-                    f"for '{term}'"
-                )
-
-                break
-
-            try:
-                data = response.json()
-
-            except Exception:
-
-                stats["api_errors"] += 1
-                break
-
-            items = data.get(
-                "items",
-                []
-            )
-
-            if not items:
-                break
-
-            stats["pages_scanned"] += 1
-
-            for company in items:
-
-                stats["companies_examined"] += 1
-
-                company_number = company.get(
-                    "company_number"
-                )
-
-                if not company_number:
-                    continue
-
-                # Avoid processing the same company repeatedly
-                # when it appears under multiple search terms.
-                if company_number in seen_in_run:
-                    continue
-
-                seen_in_run.add(
-                    company_number
-                )
-
-                status = company.get(
-                    "company_status"
-                )
-
-                if status == "active":
-                    stats["active_companies"] += 1
-                else:
-                    stats["inactive_companies"] += 1
-
-                company_name = company.get(
-                    "title",
-                    ""
-                )
-
-                if name_looks_tree_related(
-                    company_name
-                ):
-                    stats["tree_named_companies"] += 1
-
-                address = company.get(
-                    "address_snippet",
-                    ""
-                )
-
-                postcode = None
-
-                address_object = company.get(
-                    "address"
-                )
-
-                if isinstance(
-                    address_object,
-                    dict
-                ):
-                    postcode = address_object.get(
-                        "postal_code"
-                    )
-
-                if not postcode:
-                    # Fallback: find postcode in address text.
-                    postcode_match = re.search(
-                        r"\b[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2}\b",
-                        address.upper()
-                    )
-
-                    if postcode_match:
-                        postcode = postcode_match.group(
-                            0
-                        )
-
-                postcode = normalize_postcode(
-                    postcode
-                )
-
-                if postcode:
-                    stats["valid_postcodes"] += 1
-
-                companies_to_process.append({
-                    "search_term": term,
-                    "company_number": company_number,
-                    "company_name": company_name,
-                    "status": status,
-                    "address": address,
-                    "postcode": postcode,
-                    "date_of_creation":
-                        company.get(
-                            "date_of_creation"
-                        ),
-                    "company": company
-                })
-
-            # Companies House supports start_index
-            # for pagination.
-            start_index += ITEMS_PER_PAGE
-
-            if len(items) < ITEMS_PER_PAGE:
-                break
-
-            time.sleep(
-                REQUEST_DELAY
-            )
-
-    # --------------------------------------------------------
-    # STEP 2
-    # Batch postcode coordinates.
-    # --------------------------------------------------------
-
-    postcodes = [
-        company["postcode"]
-        for company in companies_to_process
-        if company["postcode"]
-    ]
-
-    coordinates = batch_postcode_coordinates(
-        postcodes
-    )
-
-    # --------------------------------------------------------
-    # STEP 3
-    # Apply geographic filter.
-    # --------------------------------------------------------
-
-    accepted_candidates = []
-
-    for company in companies_to_process:
-
-        postcode = company["postcode"]
-
-        if not postcode:
-            continue
-
-        geo = coordinates.get(
-            postcode
-        )
-
-        geographic_result = calculate_service_area(
-            postcode,
-            geo
-        )
-
-        company["latitude"] = (
-            geo["latitude"]
-            if geo
-            else None
-        )
-
-        company["longitude"] = (
-            geo["longitude"]
-            if geo
-            else None
-        )
-
-        company["distance_miles"] = (
-            geographic_result[
-                "distance_miles"
-            ]
-        )
-
-        company["service_area"] = (
-            geographic_result[
-                "service_area"
-            ]
-        )
-
-        company["accepted"] = (
-            geographic_result[
-                "accepted"
-            ]
-        )
-
-        if not company["accepted"]:
-            stats["outside_service_area"] += 1
-            continue
-
-        if company["service_area"] == "Leeds Core":
-            stats["leeds_core_matches"] += 1
-
-        elif company["service_area"] == "Leeds 15 Mile Radius":
-            stats["within_15_mile_matches"] += 1
-
-        accepted_candidates.append(
-            company
-        )
-
-    # --------------------------------------------------------
-    # STEP 4
-    # Save accepted active companies.
-    # --------------------------------------------------------
-
-    conn = None
-    cur = None
 
     try:
 
-        conn = get_db_connection()
+        conn = psycopg2.connect(SURL)
         cur = conn.cursor()
 
-        for company in accepted_candidates:
+        for search_term in SEARCH_TERMS:
 
-            if company["status"] != "active":
-                continue
-
-            company_name = company[
-                "company_name"
-            ]
-
-            company_number = company[
-                "company_number"
-            ]
-
-            address = company[
-                "address"
-            ]
-
-            postcode = company[
-                "postcode"
-            ]
-
-            confidence = calculate_company_confidence(
-                company_name,
-                address,
-                company["service_area"],
-                company["status"]
+            logger.info(
+                f"Searching Companies House for: {search_term}"
             )
 
-            # Sample results for debugging.
-            if len(stats["sample_results"]) < 20:
+            stats["search_terms"] += 1
 
-                stats["sample_results"].append({
-                    "company_name":
-                        company_name,
+            start_index = 0
 
-                    "company_number":
-                        company_number,
+            while start_index < MAX_RESULTS_PER_TERM:
 
-                    "status":
-                        company["status"],
+                try:
 
-                    "address":
-                        address,
+                    response = session.get(
+                        f"{COMPANIES_HOUSE_URL}/search/companies",
+                        params={
+                            "q": search_term,
+                            "items_per_page": ITEMS_PER_PAGE,
+                            "start_index": start_index
+                        },
+                        timeout=20
+                    )
 
-                    "postcode":
-                        postcode,
+                except Exception as e:
 
-                    "distance_from_leeds_miles":
-                        company["distance_miles"],
+                    logger.error(
+                        f"Companies House request error: {e}"
+                    )
 
-                    "service_area":
-                        company["service_area"],
+                    stats["api_errors"] += 1
+                    break
 
-                    "tree_related_name":
-                        name_looks_tree_related(
-                            company_name
+                if response.status_code != 200:
+
+                    logger.error(
+                        f"Companies House returned HTTP {response.status_code}"
+                    )
+
+                    stats["api_errors"] += 1
+                    break
+
+                try:
+
+                    data = response.json()
+
+                except Exception:
+
+                    stats["api_errors"] += 1
+                    break
+
+                items = data.get("items", [])
+
+                if not items:
+                    break
+
+                stats["pages_scanned"] += 1
+
+                for company in items:
+
+                    stats["companies_examined"] += 1
+
+                    company_number = company.get(
+                        "company_number"
+                    )
+
+                    if not company_number:
+                        continue
+
+                    if company_number in seen_in_run:
+                        continue
+
+                    seen_in_run.add(company_number)
+
+                    status = company.get(
+                        "company_status"
+                    )
+
+                    if status == "active":
+                        stats["active_companies"] += 1
+                    else:
+                        stats["inactive_companies"] += 1
+
+                    name = company.get(
+                        "title",
+                        ""
+                    )
+
+                    tree_related = name_looks_tree_related(
+                        name
+                    )
+
+                    if tree_related:
+                        stats["tree_named_companies"] += 1
+
+                    address = company.get(
+                        "address_snippet",
+                        ""
+                    )
+
+                    postcode = extract_postcode(
+                        address
+                    )
+
+                    if not postcode:
+                        continue
+
+                    stats["valid_postcodes"] += 1
+
+                    # ----------------------------------------
+                    # Postcode lookup
+                    # ----------------------------------------
+
+                    if postcode in postcode_cache:
+
+                        lat, lon = postcode_cache[postcode]
+
+                    else:
+
+                        lat, lon = postcode_coordinates(
+                            session,
+                            postcode
                         )
-                })
 
-            cur.execute(
-                """
-                SELECT 1
-                FROM potential_partners
-                WHERE company_number = %s
-                """,
-                (company_number,)
-            )
+                        postcode_cache[
+                            postcode
+                        ] = (lat, lon)
 
-            if cur.fetchone():
+                        if lat is None or lon is None:
 
-                stats["duplicates_skipped"] += 1
-                continue
+                            stats[
+                                "postcode_lookup_errors"
+                            ] += 1
 
-            companies_house_url = (
-                "https://find-and-update.company-information.service.gov.uk/company/"
-                + company_number
-            )
+                            continue
 
-            cur.execute(
-                """
-                INSERT INTO potential_partners (
-                    company_name,
-                    company_number,
-                    status,
-                    address,
-                    postcode,
-                    latitude,
-                    longitude,
-                    distance_from_leeds_miles,
-                    service_area,
-                    date_incorporated,
-                    operational_confidence,
-                    discovery_source,
-                    companies_house_url,
-                    last_verified,
-                    updated_at
-                )
-                VALUES (
-                    %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s,
-                    %s, %s, %s, NOW(), NOW()
-                )
-                """,
-                (
-                    company_name,
-                    company_number,
-                    company["status"],
-                    address,
-                    postcode,
-                    company["latitude"],
-                    company["longitude"],
-                    company["distance_miles"],
-                    company["service_area"],
-                    company["date_of_creation"],
-                    confidence,
-                    "Companies House Leeds 15 Mile Discovery",
-                    companies_house_url
-                )
-            )
+                        # Avoid hammering postcodes.io
+                        time.sleep(0.05)
 
-            stats["new_partners_added"] += 1
+                    # ----------------------------------------
+                    # Calculate distance from Leeds
+                    # ----------------------------------------
 
-            if (
-                len(
-                    stats["sample_leeds_matches"]
-                ) < 20
-            ):
+                    distance = distance_miles(
+                        LEEDS_LAT,
+                        LEEDS_LON,
+                        lat,
+                        lon
+                    )
 
-                stats[
-                    "sample_leeds_matches"
-                ].append({
-                    "company_name":
-                        company_name,
+                    distance = round(
+                        distance,
+                        2
+                    )
 
-                    "company_number":
-                        company_number,
+                    is_core = is_leeds_core_postcode(
+                        postcode
+                    )
 
-                    "status":
-                        company["status"],
+                    if is_core:
 
-                    "address":
-                        address,
+                        stats[
+                            "leeds_core_matches"
+                        ] += 1
 
-                    "postcode":
-                        postcode,
+                    if distance <= SERVICE_RADIUS_MILES:
 
-                    "distance_from_leeds_miles":
-                        company["distance_miles"],
+                        stats[
+                            "within_15_mile_matches"
+                        ] += 1
 
-                    "service_area":
-                        company["service_area"],
-
-                    "tree_related_name":
-                        name_looks_tree_related(
-                            company_name
+                        service_area = (
+                            "Leeds Core"
+                            if is_core
+                            else "Leeds 15 Mile Service Area"
                         )
-                })
 
-        conn.commit()
+                        # Only active businesses become partners.
+                        if status == "active":
+
+                            result = save_partner(
+                                cur=cur,
+                                company=company,
+                                address=address,
+                                postcode=postcode,
+                                distance=distance,
+                                service_area=service_area,
+                                tree_related_name=tree_related,
+                                search_term=search_term
+                            )
+
+                            if result == "new":
+
+                                stats[
+                                    "new_partners_added"
+                                ] += 1
+
+                            elif result == "duplicate":
+
+                                stats[
+                                    "duplicates_skipped"
+                                ] += 1
+
+                        # Sample results
+                        if len(
+                            stats["sample_leeds_matches"]
+                        ) < 20:
+
+                            stats[
+                                "sample_leeds_matches"
+                            ].append({
+                                "company_name": name,
+                                "company_number": company_number,
+                                "status": status,
+                                "address": address,
+                                "postcode": postcode,
+                                "distance_from_leeds_miles": distance,
+                                "service_area": service_area,
+                                "tree_related_name": tree_related
+                            })
+
+                    else:
+
+                        stats[
+                            "outside_service_area"
+                        ] += 1
+
+                    # General sample results
+                    if len(
+                        stats["sample_results"]
+                    ) < 20:
+
+                        stats[
+                            "sample_results"
+                        ].append({
+                            "search_term": search_term,
+                            "company_name": name,
+                            "company_number": company_number,
+                            "status": status,
+                            "address": address,
+                            "postcode": postcode,
+                            "distance_from_leeds_miles": distance,
+                            "leeds_core": is_core,
+                            "within_15_miles": (
+                                distance <= SERVICE_RADIUS_MILES
+                            ),
+                            "tree_related_name": tree_related
+                        })
+
+                conn.commit()
+
+                # ----------------------------------------
+                # Pagination
+                # ----------------------------------------
+
+                start_index += ITEMS_PER_PAGE
+
+                if len(items) < ITEMS_PER_PAGE:
+                    break
+
+                # Respectful delay
+                time.sleep(REQUEST_DELAY)
+
+        cur.close()
+        conn.close()
+
+        return stats
 
     except Exception as e:
 
-        if conn:
-            conn.rollback()
-
-        logger.error(
-            f"Database save error: {e}"
+        logger.exception(
+            "Database save/discovery error"
         )
 
         return {
@@ -1158,220 +818,9 @@ def discover_leeds_partners():
             "stats": stats
         }
 
-    finally:
-
-        if cur:
-            cur.close()
-
-        if conn:
-            conn.close()
-
-    return stats
-
 
 # ============================================================
-# COUNCIL HELPERS
-# ============================================================
-
-def extract_council_text(record):
-    """
-    Find the most useful descriptive field in a Leeds
-    Council planning record.
-    """
-
-    # First preference: known descriptive fields.
-    preferred_keys = [
-        "PROPOSAL",
-        "Proposal",
-        "proposal",
-        "DESCRIPTION",
-        "Description",
-        "description",
-        "DEVELOPMENT_DESCRIPTION",
-        "development_description",
-        "Nature",
-        "NATURE",
-        "details",
-        "DETAILS"
-    ]
-
-    for key in preferred_keys:
-
-        value = record.get(key)
-
-        if value:
-            text = clean_text(value)
-
-            if len(text) > 5:
-                return text
-
-    # Fallback: inspect all fields.
-    for key, value in record.items():
-
-        if not value:
-            continue
-
-        key_lower = key.lower()
-
-        if any(
-            word in key_lower
-            for word in [
-                "proposal",
-                "description",
-                "development",
-                "nature",
-                "detail"
-            ]
-        ):
-
-            text = clean_text(value)
-
-            if len(text) > 5:
-                return text
-
-    return ""
-
-
-def extract_council_address(record):
-    """
-    Pull the best available address from the council
-    record.
-    """
-
-    preferred_keys = [
-        "siteAddress",
-        "site_address",
-        "SiteAddress",
-        "address",
-        "Address",
-        "ADDRESS",
-        "SITEADDRESS"
-    ]
-
-    for key in preferred_keys:
-
-        value = record.get(key)
-
-        if value:
-            return clean_text(value)
-
-    # Fallback: search keys containing address.
-    for key, value in record.items():
-
-        if value and "address" in key.lower():
-            return clean_text(value)
-
-    return ""
-
-
-def extract_application_reference(record):
-    keys = [
-        "reference",
-        "Reference",
-        "application_reference",
-        "APPLICATION_REFERENCE",
-        "app_no",
-        "AppNo",
-        "application_number",
-        "ApplicationNumber"
-    ]
-
-    for key in keys:
-
-        value = record.get(key)
-
-        if value:
-            return clean_text(value)
-
-    return ""
-
-
-def extract_record_date(record):
-    keys = [
-        "received_date",
-        "ReceivedDate",
-        "date_received",
-        "DateReceived",
-        "received",
-        "Received"
-    ]
-
-    for key in keys:
-
-        value = record.get(key)
-
-        if value:
-            return clean_text(value)
-
-    return ""
-
-
-def smart_classify(record):
-
-    description = extract_council_text(
-        record
-    ).lower()
-
-    if not description:
-        return False, 0, ""
-
-    tree_matches = [
-        word
-        for word in TREE_GOLD
-        if word in description
-    ]
-
-    if not tree_matches:
-        return False, 0, description
-
-    score = len(
-        tree_matches
-    ) * 5
-
-    if any(
-        word in description
-        for word in [
-            "fell",
-            "felling",
-            "tpo",
-            "remove",
-            "removal",
-            "prune",
-            "pruning",
-            "crown"
-        ]
-    ):
-        score += 15
-
-    return (
-        score >= 10,
-        score,
-        description
-    )
-
-
-def create_lead_summary(description):
-    """
-    Convert the council's proposal into a clean summary
-    for humans and downstream lead selling.
-    """
-
-    description = clean_text(
-        description
-    )
-
-    if not description:
-        return "Tree-related planning application"
-
-    # Avoid returning enormous council descriptions.
-    if len(description) > 350:
-        description = description[:347] + "..."
-
-    return description
-
-
-# ============================================================
-# LEEDS COUNCIL DATA ENGINE
+# LEEDS COUNCIL PLANNING DATA
 # ============================================================
 
 def fetch_council():
@@ -1379,30 +828,35 @@ def fetch_council():
     session = requests.Session()
 
     session.headers.update({
-        "User-Agent":
-            "VectorDataLabs/82.0",
-        "Referer":
-            "https://www.leeds.gov.uk/"
+        "User-Agent": "VectorDataLabs/82.0",
+        "Referer": "https://www.leeds.gov.uk/"
     })
+
+    url = (
+        "https://mapservices.leeds.gov.uk/"
+        "arcgis/rest/services/Public/"
+        "Planning/MapServer/12/query"
+    )
 
     try:
 
         params = {
             "where": "1=1",
             "outFields": "*",
-            "resultRecordCount": 200,
+            "resultRecordCount": 100,
             "orderByFields": "OBJECTID DESC",
             "f": "json"
         }
 
         response = session.get(
-            LEEDS_COUNCIL_URL,
+            url,
             params=params,
-            timeout=30,
+            timeout=20,
             verify=False
         )
 
         if response.status_code != 200:
+
             return [], "Offline"
 
         data = response.json()
@@ -1423,180 +877,172 @@ def fetch_council():
     except Exception as e:
 
         logger.error(
-            f"Leeds Council error: {e}"
+            f"Leeds Council request error: {e}"
         )
 
         return [], "Fault"
 
 
 # ============================================================
-# COUNCIL TREE LEAD PROCESSOR
+# COUNCIL TREE CLASSIFICATION
 # ============================================================
 
-def process_council_leads():
+TREE_GOLD = [
+    "tree",
+    "trees",
+    "tpo",
+    "fell",
+    "felling",
+    "arboriculture",
+    "arborist",
+    "crown",
+    "pruning",
+    "prune",
+    "stump",
+    "oak",
+    "ash",
+    "willow",
+    "cedar",
+    "sycamore",
+    "beech",
+    "hedge",
+    "woodland"
+]
+
+
+DESCRIPTION_FIELDS = [
+    "proposal",
+    "description",
+    "development_description",
+    "nature",
+    "details",
+    "PROPOSAL",
+    "siteAddress",
+    "site_address",
+    "address"
+]
+
+
+def extract_council_description(record):
+
+    # First look for likely planning-description fields.
+    for key in record.keys():
+
+        key_lower = str(key).lower()
+
+        for field in DESCRIPTION_FIELDS:
+
+            if field.lower() == key_lower:
+
+                value = record.get(key)
+
+                if value:
+                    return str(value).strip()
+
+    # Fallback: inspect all text fields.
+    for key, value in record.items():
+
+        if isinstance(value, str):
+
+            text = value.strip()
+
+            if any(
+                term in text.lower()
+                for term in TREE_GOLD
+            ):
+
+                return text
+
+    return ""
+
+
+def smart_classify(record):
+
+    description = extract_council_description(
+        record
+    )
+
+    if not description:
+
+        return False, 0, ""
+
+    text = description.lower()
+
+    matches = []
+
+    for word in TREE_GOLD:
+
+        if word in text:
+            matches.append(word)
+
+    if not matches:
+
+        return False, 0, description
+
+    score = len(
+        set(matches)
+    ) * 5
+
+    if any(
+        x in text
+        for x in [
+            "fell",
+            "felling",
+            "tpo",
+            "remove",
+            "removal",
+            "pruning"
+        ]
+    ):
+
+        score += 15
+
+    return (
+        score >= 10,
+        score,
+        description
+    )
+
+
+# ============================================================
+# LEEDS COUNCIL LEAD TEST
+# ============================================================
+
+def get_council_leads():
 
     records, status = fetch_council()
 
-    if status != "Online":
-
-        return {
-            "status": status,
-            "records_downloaded": 0,
-            "tree_related_records": 0,
-            "tree_applications": []
-        }
-
-    candidates = []
+    leads = []
 
     for record in records:
 
-        is_tree, score, description = (
-            smart_classify(record)
-        )
-
-        if not is_tree:
-            continue
-
-        address = extract_council_address(
+        matched, score, description = smart_classify(
             record
         )
 
-        reference = (
-            extract_application_reference(
-                record
-            )
-        )
+        if not matched:
+            continue
 
-        received_date = (
-            extract_record_date(
-                record
-            )
-        )
+        # Create a clean human-readable lead.
+        lead = {
+            "score": score,
+            "summary": description,
+            "record": record
+        }
 
-        summary = create_lead_summary(
-            description
-        )
+        leads.append(lead)
 
-        candidates.append({
-            "application_reference":
-                reference,
-
-            "received_date":
-                received_date,
-
-            "address":
-                address,
-
-            "summary":
-                summary,
-
-            "score":
-                score,
-
-            "raw_record":
-                record
-        })
-
-    return {
-        "status": status,
-        "records_downloaded": len(records),
-        "tree_related_records": len(candidates),
-        "tree_applications": candidates
-    }
-
-
-# ============================================================
-# DATABASE SAVE FOR COUNCIL LEADS
-# ============================================================
-
-def save_council_leads(leads):
-
-    if not SURL:
-        return 0
-
-    saved = 0
-
-    try:
-
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        for lead in leads:
-
-            reference = (
-                lead["application_reference"]
-            )
-
-            if not reference:
-                # We need a stable identifier for
-                # duplicate protection.
-                continue
-
-            cur.execute(
-                """
-                SELECT 1
-                FROM council_tree_leads
-                WHERE council = %s
-                AND application_reference = %s
-                """,
-                (
-                    "Leeds",
-                    reference
-                )
-            )
-
-            if cur.fetchone():
-                continue
-
-            cur.execute(
-                """
-                INSERT INTO council_tree_leads (
-                    council,
-                    application_reference,
-                    received_date,
-                    address,
-                    summary,
-                    full_description,
-                    source,
-                    updated_at
-                )
-                VALUES (
-                    %s, %s, NULL, %s,
-                    %s, %s,
-                    %s, NOW()
-                )
-                """,
-                (
-                    "Leeds",
-                    reference,
-                    lead["address"],
-                    lead["summary"],
-                    lead["summary"],
-                    "Leeds City Council"
-                )
-            )
-
-            saved += 1
-
-        conn.commit()
-
-        cur.close()
-        conn.close()
-
-    except Exception as e:
-
-        logger.error(
-            f"Council lead database error: {e}"
-        )
-
-    return saved
+    return records, status, leads
 
 
 # ============================================================
 # HOME PAGE
 # ============================================================
 
-@app.get("/")
+@app.get(
+    "/",
+    response_class=HTMLResponse
+)
 def lander():
 
     return """
@@ -1607,7 +1053,7 @@ def lander():
     </head>
 
     <body style="
-        font-family: Arial, sans-serif;
+        font-family:Arial,sans-serif;
         text-align:center;
         padding-top:50px;
         background:#f4f4f9;
@@ -1628,7 +1074,7 @@ def lander():
             </h1>
 
             <h2>
-                V82 Leeds Lead Discovery
+                V82.0 Leeds Discovery Master
             </h2>
 
             <div style="
@@ -1640,62 +1086,50 @@ def lander():
                 font-size:14px;
             ">
 
-                <b>Geographic strategy</b><br><br>
-
-                Leeds LS postcode districts =
-                <b>Leeds Core</b><br>
-
-                Non-LS postcode =
-                <b>maximum 15 miles from Leeds</b><br><br>
-
-                Companies House =
-                <b>Paginated discovery</b><br>
-
-                Council =
-                <b>Tree-work classification</b>
+                <b>Core area:</b> Leeds LS postcodes<br>
+                <b>Extended area:</b> 15-mile radius from Leeds<br>
+                <b>Business source:</b> Companies House<br>
+                <b>Planning source:</b> Leeds City Council
 
             </div>
 
             <a href="/research-leeds"
                style="
-                   display:inline-block;
-                   padding:14px 28px;
-                   background:#1b5e20;
-                   color:white;
-                   text-decoration:none;
-                   border-radius:5px;
-                   font-weight:bold;
-               ">
+                display:inline-block;
+                padding:12px 25px;
+                background:#1b5e20;
+                color:white;
+                text-decoration:none;
+                border-radius:5px;
+                font-weight:bold;
+            ">
                 Run Leeds Business Research
             </a>
 
             <br><br>
 
             <a href="/test-regional"
-               style="
-                   color:#555;
-               ">
-                Test Leeds Council Leads
+               style="color:#555;">
+                Check Leeds Council Leads
             </a>
 
             <br><br>
 
             <a href="/docs"
-               style="
-                   color:#777;
-               ">
+               style="color:#555;">
                 API Documentation
             </a>
 
         </div>
 
     </body>
+
     </html>
     """
 
 
 # ============================================================
-# COMPANIES HOUSE ROUTE
+# BUSINESS DISCOVERY ROUTE
 # ============================================================
 
 @app.get("/research-leeds")
@@ -1705,47 +1139,20 @@ def run_discovery():
 
 
 # ============================================================
-# COUNCIL TEST ROUTE
+# LEEDS COUNCIL TEST ROUTE
 # ============================================================
 
 @app.get("/test-regional")
 def test_leeds():
 
-    result = process_council_leads()
-
-    saved = save_council_leads(
-        result["tree_applications"]
-    )
-
-    result["new_database_leads"] = saved
-
-    return result
-
-
-# ============================================================
-# FULL TEST ROUTE
-# ============================================================
-
-@app.get("/test-all")
-def test_all():
-
-    company_result = discover_leeds_partners()
-
-    council_result = process_council_leads()
-
-    council_saved = save_council_leads(
-        council_result["tree_applications"]
-    )
+    records, status, leads = get_council_leads()
 
     return {
-        "companies_house":
-            company_result,
-
-        "leeds_council":
-            council_result,
-
-        "new_council_database_leads":
-            council_saved
+        "council": "Leeds",
+        "status": status,
+        "records_checked": len(records),
+        "leads_detected": len(leads),
+        "leads": leads
     }
 
 
@@ -1757,68 +1164,31 @@ def test_all():
 def health():
 
     return {
-        "status": "healthy",
-        "version": "V82.0",
-        "service_area": "Leeds Core + 15 mile external radius",
-        "companies_house":
-            bool(CH_KEY),
-        "database":
-            bool(SURL),
-        "timestamp":
-            datetime.now(
-                timezone.utc
-            ).isoformat()
+        "status": "online",
+        "version": "82.0",
+        "database_configured": bool(SURL),
+        "companies_house_configured": bool(CH_KEY),
+        "service_area_miles": SERVICE_RADIUS_MILES
     }
 
 
 # ============================================================
-# OPTIONAL PROTECTED TRIGGER
+# RUN LOCALLY
 # ============================================================
 
-@app.get("/trigger-scrape")
-def trigger_scrape(
-    x_trigger_secret: str = Header(
-        default=""
-    )
-):
+if __name__ == "__main__":
 
-    if T_SEC and x_trigger_secret != T_SEC:
-        raise HTTPException(
-            status_code=403,
-            detail="Invalid trigger secret"
+    import uvicorn
+
+    port = int(
+        os.getenv(
+            "PORT",
+            "10000"
         )
-
-    council_result = (
-        process_council_leads()
     )
 
-    saved = save_council_leads(
-        council_result[
-            "tree_applications"
-        ]
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port
     )
-
-    return {
-        "status": "success",
-
-        "council":
-            "Leeds",
-
-        "records_downloaded":
-            council_result[
-                "records_downloaded"
-            ],
-
-        "tree_related_records":
-            council_result[
-                "tree_related_records"
-            ],
-
-        "new_leads_saved":
-            saved,
-
-        "leads":
-            council_result[
-                "tree_applications"
-            ]
-    }
