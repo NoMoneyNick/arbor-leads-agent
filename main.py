@@ -10,19 +10,17 @@ import threading
 
 from datetime import datetime, timezone
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 
 # ============================================================
 # VECTOR DATA LABS
-# V83.0 - LEEDS DISCOVERY BACKGROUND RESEARCH
+# V83.0 - LEEDS DISCOVERY + SAFE BACKGROUND RESEARCH
 # ============================================================
 
-urllib3.disable_warnings(
-    urllib3.exceptions.InsecureRequestWarning
-)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = FastAPI(
-    title="Vector Data Labs - V83.0 Leeds Discovery",
+    title="Vector Data Labs - V83.0 Leeds Lead Discovery",
     docs_url="/docs"
 )
 
@@ -37,9 +35,7 @@ logger = logging.getLogger("vector-data-labs")
 SURL = os.getenv("SUPABASE_DB_URL")
 CH_KEY = os.getenv("COMPANIES_HOUSE_KEY")
 
-COMPANIES_HOUSE_URL = (
-    "https://api.company-information.service.gov.uk"
-)
+COMPANIES_HOUSE_URL = "https://api.company-information.service.gov.uk"
 
 SEARCH_TERMS = [
     "tree",
@@ -73,11 +69,11 @@ LEEDS_LON = -1.5491
 research_lock = threading.Lock()
 
 research_state = {
-    "running": False,
+    "status": "idle",
     "started_at": None,
     "finished_at": None,
-    "result": None,
-    "error": None
+    "message": "No research has been run yet.",
+    "stats": None
 }
 
 
@@ -155,8 +151,7 @@ def init_db():
 
         cur.execute("""
             ALTER TABLE potential_partners
-            ADD COLUMN IF NOT EXISTS tree_related_name BOOLEAN
-            DEFAULT FALSE;
+            ADD COLUMN IF NOT EXISTS tree_related_name BOOLEAN DEFAULT FALSE;
         """)
 
         cur.execute("""
@@ -191,10 +186,7 @@ def get_ch_session():
 
     session = requests.Session()
 
-    session.auth = (
-        CH_KEY,
-        ""
-    )
+    session.auth = (CH_KEY, "")
 
     session.headers.update({
         "User-Agent": "VectorDataLabs/83.0"
@@ -241,7 +233,7 @@ def clean_postcode(value):
 
 
 # ============================================================
-# EXTRACT POSTCODE
+# EXTRACT POSTCODE FROM ADDRESS
 # ============================================================
 
 def extract_postcode(address):
@@ -269,10 +261,7 @@ def extract_postcode(address):
 # POSTCODE -> COORDINATES
 # ============================================================
 
-def postcode_coordinates(
-    session,
-    postcode
-):
+def postcode_coordinates(session, postcode):
 
     if not postcode:
         return None, None
@@ -290,7 +279,6 @@ def postcode_coordinates(
         )
 
         if response.status_code != 200:
-
             return None, None
 
         data = response.json()
@@ -298,45 +286,33 @@ def postcode_coordinates(
         result = data.get("result")
 
         if not result:
-
             return None, None
 
         lat = result.get("latitude")
         lon = result.get("longitude")
 
         if lat is None or lon is None:
-
             return None, None
 
-        return (
-            float(lat),
-            float(lon)
-        )
+        return float(lat), float(lon)
 
     except Exception as e:
 
         logger.warning(
-            f"Postcode lookup failed for "
-            f"{postcode}: {e}"
+            f"Postcode lookup failed for {postcode}: {e}"
         )
 
         return None, None
 
 
 # ============================================================
-# HAVERSINE DISTANCE
+# SAFE HAVERSINE DISTANCE
+#
+# V83 FIX:
+# Never attempt math.radians(None)
 # ============================================================
 
-def distance_miles(
-    lat1,
-    lon1,
-    lat2,
-    lon2
-):
-
-    # IMPORTANT:
-    # Never attempt mathematical calculations
-    # when coordinates are missing.
+def distance_miles(lat1, lon1, lat2, lon2):
 
     if (
         lat1 is None
@@ -344,7 +320,6 @@ def distance_miles(
         or lat2 is None
         or lon2 is None
     ):
-
         return None
 
     try:
@@ -389,9 +364,7 @@ def distance_miles(
         math.sqrt(1 - a)
     )
 
-    kilometres = (
-        earth_radius_km * c
-    )
+    kilometres = earth_radius_km * c
 
     return kilometres * 0.621371
 
@@ -428,7 +401,7 @@ def name_looks_tree_related(name):
     if not name:
         return False
 
-    name = name.lower()
+    name = str(name).lower()
 
     return any(
         term in name
@@ -437,17 +410,15 @@ def name_looks_tree_related(name):
 
 
 # ============================================================
-# SERVICE AREA
+# SERVICE AREA CLASSIFICATION
 # ============================================================
 
 def classify_service_area(distance):
 
     if distance is None:
-
         return "Unknown"
 
     if distance <= SERVICE_RADIUS_MILES:
-
         return "Leeds 15 Mile Service Area"
 
     return "Outside Service Area"
@@ -473,7 +444,6 @@ def save_partner(
     )
 
     if not company_number:
-
         return "invalid"
 
     cur.execute(
@@ -482,9 +452,7 @@ def save_partner(
         FROM potential_partners
         WHERE company_number = %s
         """,
-        (
-            company_number,
-        )
+        (company_number,)
     )
 
     if cur.fetchone():
@@ -499,9 +467,9 @@ def save_partner(
                 distance_from_leeds_miles = %s,
                 service_area = %s,
                 tree_related_name = %s,
+                search_term = %s,
                 last_verified = NOW(),
-                updated_at = NOW(),
-                search_term = %s
+                updated_at = NOW()
             WHERE company_number = %s
             """,
             (
@@ -560,12 +528,8 @@ def save_partner(
         (
             company.get("title"),
             company_number,
-            company.get(
-                "company_status"
-            ),
-            company.get(
-                "date_of_creation"
-            ),
+            company.get("company_status"),
+            company.get("date_of_creation"),
             address,
             postcode,
             distance,
@@ -574,9 +538,8 @@ def save_partner(
             50,
             "Companies House Leeds 15 Mile Discovery",
             (
-                "https://find-and-update."
-                "company-information.service.gov.uk/"
-                f"company/{company_number}"
+                "https://find-and-update.company-information."
+                f"service.gov.uk/company/{company_number}"
             ),
             search_term
         )
@@ -595,18 +558,14 @@ def discover_leeds_partners():
 
         return {
             "status": "error",
-            "message": (
-                "COMPANIES_HOUSE_KEY missing"
-            )
+            "message": "COMPANIES_HOUSE_KEY missing"
         }
 
     if not SURL:
 
         return {
             "status": "error",
-            "message": (
-                "SUPABASE_DB_URL missing"
-            )
+            "message": "SUPABASE_DB_URL missing"
         }
 
     stats = {
@@ -642,24 +601,19 @@ def discover_leeds_partners():
     try:
 
         conn = psycopg2.connect(SURL)
-
         cur = conn.cursor()
 
         for search_term in SEARCH_TERMS:
 
             logger.info(
-                f"Searching Companies House for: "
-                f"{search_term}"
+                f"Searching Companies House for: {search_term}"
             )
 
             stats["search_terms"] += 1
 
             start_index = 0
 
-            while (
-                start_index
-                < MAX_RESULTS_PER_TERM
-            ):
+            while start_index < MAX_RESULTS_PER_TERM:
 
                 try:
 
@@ -670,10 +624,8 @@ def discover_leeds_partners():
                         ),
                         params={
                             "q": search_term,
-                            "items_per_page":
-                                ITEMS_PER_PAGE,
-                            "start_index":
-                                start_index
+                            "items_per_page": ITEMS_PER_PAGE,
+                            "start_index": start_index
                         },
                         timeout=20
                     )
@@ -681,14 +633,10 @@ def discover_leeds_partners():
                 except Exception as e:
 
                     logger.error(
-                        "Companies House request "
-                        f"error: {e}"
+                        f"Companies House request error: {e}"
                     )
 
-                    stats[
-                        "api_errors"
-                    ] += 1
-
+                    stats["api_errors"] += 1
                     break
 
                 if response.status_code != 200:
@@ -698,10 +646,7 @@ def discover_leeds_partners():
                         f"HTTP {response.status_code}"
                     )
 
-                    stats[
-                        "api_errors"
-                    ] += 1
-
+                    stats["api_errors"] += 1
                     break
 
                 try:
@@ -710,10 +655,7 @@ def discover_leeds_partners():
 
                 except Exception:
 
-                    stats[
-                        "api_errors"
-                    ] += 1
-
+                    stats["api_errors"] += 1
                     break
 
                 items = data.get(
@@ -722,12 +664,9 @@ def discover_leeds_partners():
                 )
 
                 if not items:
-
                     break
 
-                stats[
-                    "pages_scanned"
-                ] += 1
+                stats["pages_scanned"] += 1
 
                 for company in items:
 
@@ -735,10 +674,8 @@ def discover_leeds_partners():
                         "companies_examined"
                     ] += 1
 
-                    company_number = (
-                        company.get(
-                            "company_number"
-                        )
+                    company_number = company.get(
+                        "company_number"
                     )
 
                     if not company_number:
@@ -756,13 +693,10 @@ def discover_leeds_partners():
                     )
 
                     if status == "active":
-
                         stats[
                             "active_companies"
                         ] += 1
-
                     else:
-
                         stats[
                             "inactive_companies"
                         ] += 1
@@ -794,7 +728,6 @@ def discover_leeds_partners():
                     )
 
                     if not postcode:
-
                         continue
 
                     stats[
@@ -807,54 +740,33 @@ def discover_leeds_partners():
 
                     if postcode in postcode_cache:
 
-                        lat, lon = (
-                            postcode_cache[
-                                postcode
-                            ]
-                        )
+                        lat, lon = postcode_cache[
+                            postcode
+                        ]
 
                     else:
 
-                        lat, lon = (
-                            postcode_coordinates(
-                                session,
-                                postcode
-                            )
+                        lat, lon = postcode_coordinates(
+                            session,
+                            postcode
                         )
 
                         postcode_cache[
                             postcode
-                        ] = (
-                            lat,
-                            lon
-                        )
+                        ] = (lat, lon)
 
-                        if (
-                            lat is None
-                            or lon is None
-                        ):
+                        if lat is None or lon is None:
 
                             stats[
                                 "postcode_lookup_errors"
                             ] += 1
 
-                            stats[
-                                "unknown_distance"
-                            ] += 1
-
-                            # IMPORTANT:
-                            # Skip this company rather than
-                            # allowing None to reach
-                            # distance_miles().
-
                             continue
 
-                        time.sleep(
-                            0.05
-                        )
+                        time.sleep(0.05)
 
                     # ----------------------------------------
-                    # DISTANCE
+                    # SAFE DISTANCE CALCULATION
                     # ----------------------------------------
 
                     distance = distance_miles(
@@ -864,12 +776,36 @@ def discover_leeds_partners():
                         lon
                     )
 
-                    # Extra safety check.
+                    # ----------------------------------------
+                    # IMPORTANT:
+                    # Never compare None with a number.
+                    # ----------------------------------------
+
                     if distance is None:
 
                         stats[
                             "unknown_distance"
                         ] += 1
+
+                        if len(
+                            stats["sample_results"]
+                        ) < 20:
+
+                            stats[
+                                "sample_results"
+                            ].append({
+                                "search_term": search_term,
+                                "company_name": name,
+                                "company_number": company_number,
+                                "status": status,
+                                "address": address,
+                                "postcode": postcode,
+                                "distance_from_leeds_miles": None,
+                                "leeds_core": False,
+                                "within_15_miles": False,
+                                "tree_related_name": tree_related,
+                                "distance_status": "unknown"
+                            })
 
                         continue
 
@@ -891,8 +827,7 @@ def discover_leeds_partners():
                         ] += 1
 
                     within_radius = (
-                        distance
-                        <= SERVICE_RADIUS_MILES
+                        distance <= SERVICE_RADIUS_MILES
                     )
 
                     if within_radius:
@@ -905,8 +840,7 @@ def discover_leeds_partners():
                             "Leeds Core"
                             if is_core
                             else
-                            "Leeds 15 Mile "
-                            "Service Area"
+                            "Leeds 15 Mile Service Area"
                         )
 
                         if status == "active":
@@ -918,12 +852,8 @@ def discover_leeds_partners():
                                 postcode=postcode,
                                 distance=distance,
                                 service_area=service_area,
-                                tree_related_name=(
-                                    tree_related
-                                ),
-                                search_term=(
-                                    search_term
-                                )
+                                tree_related_name=tree_related,
+                                search_term=search_term
                             )
 
                             if result == "new":
@@ -947,22 +877,14 @@ def discover_leeds_partners():
                             stats[
                                 "sample_leeds_matches"
                             ].append({
-                                "company_name":
-                                    name,
-                                "company_number":
-                                    company_number,
-                                "status":
-                                    status,
-                                "address":
-                                    address,
-                                "postcode":
-                                    postcode,
-                                "distance_from_leeds_miles":
-                                    distance,
-                                "service_area":
-                                    service_area,
-                                "tree_related_name":
-                                    tree_related
+                                "company_name": name,
+                                "company_number": company_number,
+                                "status": status,
+                                "address": address,
+                                "postcode": postcode,
+                                "distance_from_leeds_miles": distance,
+                                "service_area": service_area,
+                                "tree_related_name": tree_related
                             })
 
                     else:
@@ -976,44 +898,29 @@ def discover_leeds_partners():
                     # ----------------------------------------
 
                     if len(
-                        stats[
-                            "sample_results"
-                        ]
+                        stats["sample_results"]
                     ) < 20:
 
                         stats[
                             "sample_results"
                         ].append({
-                            "search_term":
-                                search_term,
-                            "company_name":
-                                name,
-                            "company_number":
-                                company_number,
-                            "status":
-                                status,
-                            "address":
-                                address,
-                            "postcode":
-                                postcode,
-                            "distance_from_leeds_miles":
-                                distance,
-                            "leeds_core":
-                                is_core,
-                            "within_15_miles":
-                                within_radius,
-                            "tree_related_name":
-                                tree_related
+                            "search_term": search_term,
+                            "company_name": name,
+                            "company_number": company_number,
+                            "status": status,
+                            "address": address,
+                            "postcode": postcode,
+                            "distance_from_leeds_miles": distance,
+                            "leeds_core": is_core,
+                            "within_15_miles": within_radius,
+                            "tree_related_name": tree_related
                         })
 
                 conn.commit()
 
-                start_index += (
-                    ITEMS_PER_PAGE
-                )
+                start_index += ITEMS_PER_PAGE
 
                 if len(items) < ITEMS_PER_PAGE:
-
                     break
 
                 time.sleep(
@@ -1028,7 +935,11 @@ def discover_leeds_partners():
             "Database save/discovery error"
         )
 
-        stats["status"] = "error"
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
 
         return {
             "status": "error",
@@ -1038,58 +949,73 @@ def discover_leeds_partners():
 
     finally:
 
-        try:
-
-            if cur:
+        if cur:
+            try:
                 cur.close()
+            except Exception:
+                pass
 
-        except Exception:
-            pass
-
-        try:
-
-            if conn:
+        if conn:
+            try:
                 conn.close()
-
-        except Exception:
-            pass
+            except Exception:
+                pass
 
 
 # ============================================================
-# BACKGROUND RESEARCH WORKER
+# BACKGROUND WORKER
 # ============================================================
 
-def background_research():
+def background_research_worker():
 
     global research_state
 
-    try:
+    logger.info(
+        "BACKGROUND RESEARCH STARTED"
+    )
 
-        logger.info(
-            "BACKGROUND RESEARCH STARTED"
+    with research_lock:
+
+        research_state["status"] = "running"
+        research_state["started_at"] = (
+            datetime.now(timezone.utc).isoformat()
         )
+        research_state["finished_at"] = None
+        research_state["message"] = (
+            "Research is currently running."
+        )
+        research_state["stats"] = None
+
+    try:
 
         result = discover_leeds_partners()
 
         with research_lock:
 
-            research_state[
-                "result"
-            ] = result
+            if result.get("status") == "success":
 
-            research_state[
-                "finished_at"
-            ] = datetime.now(
-                timezone.utc
-            ).isoformat()
+                research_state["status"] = "completed"
+                research_state["message"] = (
+                    "Research completed successfully."
+                )
 
-            research_state[
-                "running"
-            ] = False
+            else:
 
-            research_state[
-                "error"
-            ] = None
+                research_state["status"] = "error"
+                research_state["message"] = (
+                    result.get(
+                        "message",
+                        "Research failed."
+                    )
+                )
+
+            research_state["finished_at"] = (
+                datetime.now(
+                    timezone.utc
+                ).isoformat()
+            )
+
+            research_state["stats"] = result
 
         logger.info(
             "BACKGROUND RESEARCH FINISHED"
@@ -1098,67 +1024,26 @@ def background_research():
     except Exception as e:
 
         logger.exception(
-            "BACKGROUND RESEARCH FAILED"
+            "BACKGROUND RESEARCH CRASHED"
         )
 
         with research_lock:
 
-            research_state[
-                "running"
-            ] = False
-
-            research_state[
-                "finished_at"
-            ] = datetime.now(
-                timezone.utc
-            ).isoformat()
-
-            research_state[
-                "error"
-            ] = str(e)
-
-            research_state[
-                "result"
-            ] = None
-
-
-# ============================================================
-# START BACKGROUND RESEARCH
-# ============================================================
-
-def start_background_research():
-
-    global research_state
-
-    with research_lock:
-
-        if research_state["running"]:
-
-            return False
-
-        research_state = {
-            "running": True,
-            "started_at":
+            research_state["status"] = "error"
+            research_state["message"] = str(e)
+            research_state["finished_at"] = (
                 datetime.now(
                     timezone.utc
-                ).isoformat(),
-            "finished_at": None,
-            "result": None,
-            "error": None
-        }
-
-    worker = threading.Thread(
-        target=background_research,
-        daemon=True
-    )
-
-    worker.start()
-
-    return True
+                ).isoformat()
+            )
+            research_state["stats"] = {
+                "status": "error",
+                "message": str(e)
+            }
 
 
 # ============================================================
-# COUNCIL PLANNING DATA
+# LEEDS COUNCIL PLANNING DATA
 # ============================================================
 
 def fetch_council():
@@ -1166,10 +1051,8 @@ def fetch_council():
     session = requests.Session()
 
     session.headers.update({
-        "User-Agent":
-            "VectorDataLabs/83.0",
-        "Referer":
-            "https://www.leeds.gov.uk/"
+        "User-Agent": "VectorDataLabs/83.0",
+        "Referer": "https://www.leeds.gov.uk/"
     })
 
     url = (
@@ -1184,8 +1067,7 @@ def fetch_council():
             "where": "1=1",
             "outFields": "*",
             "resultRecordCount": 100,
-            "orderByFields":
-                "OBJECTID DESC",
+            "orderByFields": "OBJECTID DESC",
             "f": "json"
         }
 
@@ -1277,17 +1159,11 @@ def extract_council_description(record):
                 value = record.get(key)
 
                 if value:
-
-                    return str(
-                        value
-                    ).strip()
+                    return str(value).strip()
 
     for key, value in record.items():
 
-        if isinstance(
-            value,
-            str
-        ):
+        if isinstance(value, str):
 
             text = value.strip()
 
@@ -1310,7 +1186,6 @@ def smart_classify(record):
     )
 
     if not description:
-
         return False, 0, ""
 
     text = description.lower()
@@ -1320,24 +1195,14 @@ def smart_classify(record):
     for word in TREE_GOLD:
 
         if word in text:
-
-            matches.append(
-                word
-            )
+            matches.append(word)
 
     if not matches:
 
-        return (
-            False,
-            0,
-            description
-        )
+        return False, 0, description
 
     score = (
-        len(
-            set(matches)
-        )
-        * 5
+        len(set(matches)) * 5
     )
 
     if any(
@@ -1367,39 +1232,26 @@ def smart_classify(record):
 
 def get_council_leads():
 
-    records, status = (
-        fetch_council()
-    )
+    records, status = fetch_council()
 
     leads = []
 
     for record in records:
 
         matched, score, description = (
-            smart_classify(
-                record
-            )
+            smart_classify(record)
         )
 
         if not matched:
-
             continue
 
-        lead = {
+        leads.append({
             "score": score,
             "summary": description,
             "record": record
-        }
+        })
 
-        leads.append(
-            lead
-        )
-
-    return (
-        records,
-        status,
-        leads
-    )
+    return records, status, leads
 
 
 # ============================================================
@@ -1416,15 +1268,7 @@ def lander():
     <html>
 
     <head>
-
         <title>Vector Data Labs</title>
-
-        <meta
-            name="viewport"
-            content="width=device-width,
-            initial-scale=1"
-        >
-
     </head>
 
     <body style="
@@ -1439,11 +1283,8 @@ def lander():
             padding:45px;
             background:white;
             border-radius:15px;
-            box-shadow:
-                0 10px 30px
-                rgba(0,0,0,0.1);
-            border-top:
-                6px solid #1b5e20;
+            box-shadow:0 10px 30px rgba(0,0,0,0.1);
+            border-top:6px solid #1b5e20;
             max-width:650px;
         ">
 
@@ -1452,7 +1293,7 @@ def lander():
             </h1>
 
             <h2>
-                V83.0 Leeds Discovery
+                V83.0 Leeds Lead Discovery
             </h2>
 
             <div style="
@@ -1464,66 +1305,52 @@ def lander():
                 font-size:14px;
             ">
 
-                <b>Core area:</b>
-                Leeds LS postcodes
-                <br>
-
-                <b>Extended area:</b>
-                15-mile radius from Leeds
-                <br>
-
-                <b>Business source:</b>
-                Companies House
-                <br>
-
-                <b>Planning source:</b>
-                Leeds City Council
-                <br>
-
-                <b>Research mode:</b>
-                Background processing
+                <b>Core area:</b> Leeds LS postcodes<br>
+                <b>Extended area:</b> 15-mile radius from Leeds<br>
+                <b>Business source:</b> Companies House<br>
+                <b>Planning source:</b> Leeds City Council<br>
+                <b>Research:</b> Background processing
 
             </div>
 
-            <a
-                href="/research-leeds"
-                style="
-                    display:inline-block;
-                    padding:12px 25px;
-                    background:#1b5e20;
-                    color:white;
-                    text-decoration:none;
-                    border-radius:5px;
-                    font-weight:bold;
-                "
-            >
+            <a href="/research-leeds"
+               style="
+                display:inline-block;
+                padding:12px 25px;
+                background:#1b5e20;
+                color:white;
+                text-decoration:none;
+                border-radius:5px;
+                font-weight:bold;
+            ">
                 Run Leeds Business Research
             </a>
 
             <br><br>
 
-            <a
-                href="/research-status"
-                style="color:#555;"
-            >
+            <a href="/research-status"
+               style="color:#555;">
                 Check Research Status
             </a>
 
             <br><br>
 
-            <a
-                href="/test-regional"
-                style="color:#555;"
-            >
+            <a href="/test-regional"
+               style="color:#555;">
                 Check Leeds Council Leads
             </a>
 
             <br><br>
 
-            <a
-                href="/docs"
-                style="color:#555;"
-            >
+            <a href="/health"
+               style="color:#555;">
+                Health Check
+            </a>
+
+            <br><br>
+
+            <a href="/docs"
+               style="color:#555;">
                 API Documentation
             </a>
 
@@ -1536,36 +1363,52 @@ def lander():
 
 
 # ============================================================
-# START BUSINESS RESEARCH
+# START BACKGROUND BUSINESS RESEARCH
 # ============================================================
 
-@app.get(
-    "/research-leeds"
-)
+@app.get("/research-leeds")
 def run_discovery():
 
-    started = (
-        start_background_research()
+    with research_lock:
+
+        if research_state["status"] == "running":
+
+            return {
+                "status": "already_running",
+                "message": (
+                    "Leeds business research "
+                    "is already running "
+                    "in the background."
+                ),
+                "check": "/research-status"
+            }
+
+        research_state["status"] = "starting"
+        research_state["started_at"] = (
+            datetime.now(
+                timezone.utc
+            ).isoformat()
+        )
+        research_state["finished_at"] = None
+        research_state["message"] = (
+            "Research is starting."
+        )
+        research_state["stats"] = None
+
+    thread = threading.Thread(
+        target=background_research_worker,
+        daemon=True
     )
 
-    if not started:
-
-        return {
-            "status": "already_running",
-            "message":
-                "Leeds business research "
-                "is already running.",
-            "check":
-                "/research-status"
-        }
+    thread.start()
 
     return {
         "status": "started",
-        "message":
+        "message": (
             "Leeds business research "
-            "has started in the background.",
-        "check":
-            "/research-status"
+            "has started in the background."
+        ),
+        "check": "/research-status"
     }
 
 
@@ -1573,68 +1416,35 @@ def run_discovery():
 # RESEARCH STATUS
 # ============================================================
 
-@app.get(
-    "/research-status"
-)
+@app.get("/research-status")
 def research_status():
 
     with research_lock:
 
-        state = dict(
-            research_state
-        )
-
-    if state["running"]:
-
         return {
-            "status": "running",
-            "message":
-                "Research is still running.",
-            "started_at":
-                state["started_at"],
-            "check":
-                "/research-status"
+            "status": research_state[
+                "status"
+            ],
+            "started_at": research_state[
+                "started_at"
+            ],
+            "finished_at": research_state[
+                "finished_at"
+            ],
+            "message": research_state[
+                "message"
+            ],
+            "stats": research_state[
+                "stats"
+            ]
         }
-
-    if state["error"]:
-
-        return {
-            "status": "error",
-            "message":
-                state["error"],
-            "started_at":
-                state["started_at"],
-            "finished_at":
-                state["finished_at"]
-        }
-
-    if state["result"] is not None:
-
-        return {
-            "status": "complete",
-            "started_at":
-                state["started_at"],
-            "finished_at":
-                state["finished_at"],
-            "result":
-                state["result"]
-        }
-
-    return {
-        "status": "idle",
-        "message":
-            "No Leeds business research "
-            "has been run yet."
-    }
 
 
 # ============================================================
 # LEEDS COUNCIL TEST ROUTE
 # ============================================================
 
-@app.get(
-    "/test-regional"
-)
+@app.get("/test-regional")
 def test_leeds():
 
     records, status, leads = (
@@ -1642,16 +1452,11 @@ def test_leeds():
     )
 
     return {
-        "council":
-            "Leeds",
-        "status":
-            status,
-        "records_checked":
-            len(records),
-        "leads_detected":
-            len(leads),
-        "leads":
-            leads
+        "council": "Leeds",
+        "status": status,
+        "records_checked": len(records),
+        "leads_detected": len(leads),
+        "leads": leads
     }
 
 
@@ -1659,32 +1464,22 @@ def test_leeds():
 # HEALTH CHECK
 # ============================================================
 
-@app.get(
-    "/health"
-)
+@app.get("/health")
 def health():
 
     with research_lock:
 
-        running = (
-            research_state[
-                "running"
-            ]
+        current_research_status = (
+            research_state["status"]
         )
 
     return {
-        "status":
-            "online",
-        "version":
-            "83.0",
-        "database_configured":
-            bool(SURL),
-        "companies_house_configured":
-            bool(CH_KEY),
-        "service_area_miles":
-            SERVICE_RADIUS_MILES,
-        "research_running":
-            running
+        "status": "online",
+        "version": "83.0",
+        "database_configured": bool(SURL),
+        "companies_house_configured": bool(CH_KEY),
+        "service_area_miles": SERVICE_RADIUS_MILES,
+        "research_status": current_research_status
     }
 
 
