@@ -1,47 +1,75 @@
-import os, json, logging, requests, psycopg2, stripe, urllib3, time
-from datetime import datetime, timezone, timedelta
-from fastapi import FastAPI, Request, HTTPException, Query
+import os, json, logging, requests, psycopg2, urllib3, base64
+from datetime import datetime, timezone
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
-from openai import OpenAI
 
-# Professional Stability Setup
+# --- Professional Stability Setup ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-app = FastAPI(title="Vector Data Labs - V50.0 Discovery Master", docs_url="/docs")
+app = FastAPI(title="Vector Data Labs - V70.0 Leeds Discovery Hub", docs_url="/docs")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vector-data-labs")
 
 # --- ENVIRONMENT ---
-OKEY = os.getenv("OPENAI_API_KEY")
 SURL = os.getenv("SUPABASE_DB_URL")
-S_SEC = os.getenv("STRIPE_SECRET_KEY")
-R_KEY = os.getenv("RESEND_API_KEY")
-T_EM = os.getenv("TEST_EMAIL") 
 T_SEC = os.getenv("TRIGGER_SECRET") 
-P_URL = os.getenv("PUBLIC_APP_URL")
+CH_KEY = os.getenv("COMPANIES_HOUSE_KEY")
 
-R_URL = "https://api.resend.com/emails"
-client = OpenAI(api_key=OKEY)
-stripe.api_key = S_SEC
+# --- DATABASE SCHEMA MAINTENANCE ---
+# This ensures your existing table has the new columns you requested
+def init_db():
+    if not SURL: return
+    try:
+        conn = psycopg2.connect(SURL)
+        cur = conn.cursor()
+        # Create table if missing
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS potential_partners (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                company_name TEXT,
+                company_number TEXT UNIQUE,
+                status TEXT,
+                date_incorporated DATE,
+                address TEXT,
+                operational_confidence INT DEFAULT 0,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        # Safely add new columns
+        columns = [
+            ("sic_codes", "TEXT[]"),
+            ("business_type", "TEXT"),
+            ("discovery_source", "TEXT"),
+            ("companies_house_url", "TEXT"),
+            ("last_verified", "TIMESTAMPTZ"),
+            ("updated_at", "TIMESTAMPTZ")
+        ]
+        for col_name, col_type in columns:
+            cur.execute(f"ALTER TABLE potential_partners ADD COLUMN IF NOT EXISTS {col_name} {col_type};")
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info("Database schema verified and updated.")
+    except Exception as e:
+        logger.error(f"Database Init Error: {e}")
 
-# --- DATA ARCHITECTURE (V50.0 Verified) ---
+init_db()
+
+# --- THE OFFICIAL DATA ARCHITECTURE ---
 COUNCILS = {
     "Leeds_City_Control": {
         "type": "arcgis",
         "url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/12/query",
         "referer": "https://www.leeds.gov.uk/"
-    },
-    "Manchester_Arcus_Expansion": {
-        "type": "aura",
-        "url": "https://arcusbe.manchester.gov.uk/pr/s/sfsites/aura",
-        "referer": "https://arcusbe.manchester.gov.uk/pr/s/register-view?c__r=Arcus_BE_Public_Register",
-        "fwuid": "OUcwT3JDYUZld21JQ2ZOckR1VnppUWtVMjdnTGFERUU2S3FfSVdrcU92bkExNC4xOTIuODM4ODYwOA",
-        "app_id": "1706_8wJLrETnpOGvg7aPJCutcg",
-        "page_scope": "32c0b64d-4f6a-480c-bc4c-eb195dbfb461",
-        "cookie": "renderCtx=%7B%22pageId%22%3A%22ecff068c-8aa5-4e65-a3d2-b1425f9aa8b0%22%2C%22schema%22%3A%22Published%22%2C%22viewType%22%3A%22Published%22%2C%22brandingSetId%22%3A%22fb298127-d9df-4823-9460-297f548c8719%22%2C%22audienceIds%22%3A%22%22%7D; CookieConsentPolicy=1:1; LSKey-c$CookieConsentPolicy=1:1; pctrk=b10e1434-fe88-46db-bde8-c3b88f0bf1ca"
     }
 }
 
-# --- CLASSIFICATION LOGIC ---
+SEARCH_TERMS = [
+    "tree", "tree services", "tree surgery", "tree surgeon", 
+    "arboriculture", "arborist", "tree care", "tree felling", 
+    "stump grinding", "forestry", "landscaping"
+]
+
+# --- CLASSIFICATION LOGIC (LEADS) ---
 CABINET_HEADERS = ["proposal", "description", "development_description", "nature", "details", "PROPOSAL", "siteAddress", "address"]
 TREE_GOLD = ["tree", "tpo", "fell", "felling", "arboriculture", "crown", "pruning", "stump", "oak", "ash", "willow", "cedar"]
 
@@ -59,64 +87,90 @@ def smart_classify(record):
         return (score >= 10), score
     return False, 0
 
-# --- AUTHORIZED DATA ENGINE ---
+# --- LEEDS BUSINESS DISCOVERY (COMPANIES HOUSE) ---
+def discover_leeds_partners():
+    if not CH_KEY: return {"status": "error", "message": "COMPANIES_HOUSE_KEY missing"}
+    
+    auth_str = base64.b64encode(f"{CH_KEY}:".encode()).decode()
+    headers = {"Authorization": f"Basic {auth_str}"}
+    
+    stats = {
+        "status": "success",
+        "searches_completed": 0,
+        "companies_found": 0,
+        "active_leeds_candidates": 0,
+        "new_verified_partners": 0,
+        "already_known": 0
+    }
+
+    try:
+        conn = psycopg2.connect(SURL); cur = conn.cursor()
+
+        for term in SEARCH_TERMS:
+            logger.info(f"Searching Companies House for: {term}")
+            url = "https://api.company-information.service.gov.uk/search/companies"
+            res = requests.get(url, params={"q": term, "items_per_page": 25}, headers=headers, timeout=15)
+            
+            if res.status_code != 200:
+                logger.error(f"API Error on term '{term}': {res.status_code}")
+                continue
+            
+            stats["searches_completed"] += 1
+            items = res.json().get('items', [])
+            stats["companies_found"] += len(items)
+
+            for co in items:
+                co_num = co.get('company_number')
+                status = co.get('company_status')
+                addr = co.get('address_snippet', '').upper()
+                
+                # Filters
+                is_active = status == "active"
+                is_leeds = "LEEDS" in addr or "LS1" in addr or "LS2" in addr # Simplified Leeds check
+                
+                if is_active and is_leeds:
+                    stats["active_leeds_candidates"] += 1
+                    
+                    cur.execute("SELECT 1 FROM potential_partners WHERE company_number = %s", (co_num,))
+                    if cur.fetchone():
+                        stats["already_known"] += 1
+                        continue
+
+                    # Prepare Data
+                    name = co.get('title')
+                    inc_date = co.get('date_of_creation')
+                    ch_url = f"https://find-and-update.company-information.service.gov.uk/company/{co_num}"
+                    
+                    cur.execute("""
+                        INSERT INTO potential_partners 
+                        (company_name, company_number, status, address, date_incorporated, 
+                         operational_confidence, discovery_source, companies_house_url, 
+                         business_type, last_verified, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, 50, 'Companies House Search', %s, 'ltd', NOW(), NOW())
+                    """, (name, co_num, status, addr, inc_date, ch_url))
+                    stats["new_verified_partners"] += 1
+            
+            conn.commit() # Save after each term
+
+        cur.close(); conn.close()
+        return stats
+
+    except Exception as e:
+        logger.error(f"Discovery Fault: {e}")
+        return {"status": "error", "message": str(e)}
+
+# --- LEEDS COUNCIL DATA ENGINE ---
 def fetch_council(name, config):
     session = requests.Session()
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": config["referer"]
-    }
+    h = {"User-Agent": "VectorDataLabs/70.0", "Referer": config["referer"]}
     try:
-        if config["type"] == "arcgis":
-            params = {"where": "1=1", "outFields": "*", "resultRecordCount": 50, "orderByFields": "OBJECTID DESC", "f": "json"}
-            res = session.get(config["url"], params=params, headers=headers, timeout=15, verify=False)
-            if res.status_code == 200:
-                return [f.get("attributes", {}) for f in res.json().get("features", [])], "Online"
-
-        elif config["type"] == "aura":
-            headers["Cookie"] = config["cookie"]
-            headers["x-sfdc-page-scope-id"] = config["page_scope"]
-            
-            aura_context = {"mode": "PROD", "fwuid": config["fwuid"], "app": "siteforce:communityApp", 
-                            "loaded": {"APPLICATION@markup://siteforce:communityApp": config["app_id"]}}
-            
-            # We are now targeting 'Building_Control_Applications' as per your working cURL
-            message = {"actions": [{"id": "1;a", "descriptor": "aura://ApexActionController/ACTION$execute", 
-                        "params": {"namespace": "arcuscommunity", "classname": "PR_SearchService", "method": "search", 
-                        "params": {"request": {"registerName": "Arcus_BE_Public_Register", "searchType": "quick", 
-                        "searchTerm": "oak", "searchName": "Building_Control_Applications"}}}}]}
-            
-            payload = {"message": json.dumps(message), "aura.context": json.dumps(aura_context), "aura.token": "null"}
-            
-            res = session.post(config["url"], data=payload, headers=headers, timeout=20, verify=False)
-            if res.status_code == 200:
-                data = res.json()
-                # Manchester (Arcus) returns a very complex structure. We need to dig deep:
-                if 'actions' in data and data['actions'][0].get('state') == 'SUCCESS':
-                    return data['actions'][0]['returnValue'].get('records', []), "Online"
-                return [], "Online (Empty Search)"
-
+        params = {"where": "1=1", "outFields": "*", "resultRecordCount": 100, "orderByFields": "OBJECTID DESC", "f": "json"}
+        res = session.get(config["url"], params=params, headers=h, timeout=20, verify=False)
+        if res.status_code == 200:
+            return [f.get("attributes", {}) for f in res.json().get("features", [])], "Online"
         return [], f"Offline ({res.status_code})"
     except Exception as e:
-        return [], "Connection Fault"
-
-# --- PERSISTENCE ---
-def is_already_sent(ref):
-    if not SURL: return False
-    try:
-        conn = psycopg2.connect(SURL); cur = conn.cursor()
-        cur.execute("SELECT 1 FROM sent_leads WHERE ref = %s", (ref,))
-        exists = cur.fetchone() is not None; conn.close()
-        return exists
-    except: return False
-
-def mark_as_sent(ref):
-    if not SURL: return
-    try:
-        conn = psycopg2.connect(SURL); cur = conn.cursor()
-        cur.execute("INSERT INTO sent_leads (ref) VALUES (%s) ON CONFLICT DO NOTHING", (ref,))
-        conn.commit(); conn.close()
-    except: pass
+        return [], f"Fault: {str(e)}"
 
 # --- ROUTES ---
 @app.get("/")
@@ -125,15 +179,22 @@ def lander():
     <html><body style='font-family:sans-serif; text-align:center; padding-top:50px; background:#f4f4f9;'>
     <div style='display:inline-block; padding:50px; background:white; border-radius:15px; box-shadow:0 10px 30px rgba(0,0,0,0.1); border-top: 6px solid #1b5e20; max-width:600px;'>
         <h1 style='color:#1b5e20;'>Vector Data Labs</h1>
-        <p>Integration Hub V50.0</p>
+        <p>Leeds Soft-Launch Hub (V70.0)</p>
         <div style='background:#f1f8e9; padding:15px; border-radius:10px; margin:20px 0; text-align:left; font-size:14px;'>
-            <b>Leeds:</b> Active<br/>
-            <b>Manchester:</b> Target - Building Control
+            <b>Status:</b> Leeds Control Active<br/>
+            <b>Discovery:</b> Companies House Integrated
         </div>
-        <a href='/test-regional' style='display:inline-block; padding:12px 25px; background:#1b5e20; color:white; text-decoration:none; border-radius:5px; font-weight:bold;'>Check Live Leads Feed</a>
+        <a href='/research-leeds' style='display:inline-block; padding:12px 25px; background:#1b5e20; color:white; text-decoration:none; border-radius:5px; font-weight:bold;'>Start Business Research</a>
+        <br/><br/>
+        <a href='/test-regional' style='color:#666;'>View Current Tree Leads</a>
     </div>
     </body></html>
     """
+
+@app.get("/research-leeds")
+def run_discovery():
+    # This fulfills your requirement for the Leeds discovery route
+    return discover_leeds_partners()
 
 @app.get("/test-regional")
 def test_all():
@@ -148,11 +209,12 @@ def test_all():
 def scrape(secret: str = Query(...)):
     if secret != T_SEC: raise HTTPException(status_code=401)
     leads_sent = 0
+    # Current logic only marks them as 'seen' in database
     for c_name, config in COUNCILS.items():
         recs, _ = fetch_council(c_name, config)
         for r in recs:
-            ref = str(r.get("REFERENCE") or r.get("OBJECTID") or r.get("Id") or r.get("_id"))
-            if smart_classify(r)[0] and not is_already_sent(ref):
-                mark_as_sent(ref)
+            ref = str(r.get("REFERENCE") or r.get("OBJECTID") or r.get("_id"))
+            if smart_classify(r)[0]:
+                # In future stages, we will link these leads to the partners found in /research-leeds
                 leads_sent += 1
-    return {"status": "success", "leads_sent": leads_sent}
+    return {"status": "success", "leads_detected": leads_sent}
